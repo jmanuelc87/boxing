@@ -171,6 +171,58 @@ class PoseEstimator:
         return keep_boxers(image_bgr, people) if self.boxers_only else people
 
 
+COCO_NAMES = [
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle",
+]  # fmt: skip
+
+
+class YoloPoseEstimator:
+    """Ultralytics YOLO pose model. Runs on Apple's GPU with ``device="mps"``.
+
+    Ultralytics is AGPL-3.0 licensed; see its license terms before distributing.
+    """
+
+    def __init__(
+        self,
+        weights: str = "yolo11n-pose.pt",
+        threshold: float = 0.5,
+        device: str | None = None,
+        boxers_only: bool = False,
+    ):
+        import torch
+        from ultralytics import YOLO
+
+        if device is None:
+            device = "mps" if torch.backends.mps.is_available() else "cpu"
+        self.model = YOLO(weights)
+        self.device = device
+        self.threshold = threshold
+        self.boxers_only = boxers_only
+
+    def predict(self, image_bgr: np.ndarray) -> list[Person]:
+        result = self.model.predict(image_bgr, device=self.device, conf=self.threshold, verbose=False)[0]
+        people: list[Person] = []
+        if result.boxes is None or len(result.boxes) == 0:
+            return people
+
+        xy = result.keypoints.xy.cpu().numpy()
+        kp_conf = result.keypoints.conf
+        kp_conf = kp_conf.cpu().numpy() if kp_conf is not None else np.ones(xy.shape[:2])
+        for box, score, pts, conf in zip(
+            result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy(), xy, kp_conf
+        ):
+            joints = [
+                Joint(name=name, x=float(x), y=float(y), score=float(c))
+                for name, (x, y), c in zip(COCO_NAMES, pts, conf)
+            ]
+            people.append(Person(box=[float(v) for v in box], score=float(score), keypoints=joints))
+
+        return keep_boxers(image_bgr, people) if self.boxers_only else people
+
+
 def record(people: list[Person], width: int, height: int) -> dict:
     return {"width": width, "height": height, "people": [asdict(p) for p in people]}
 
@@ -247,7 +299,7 @@ def run_video(estimator: PoseEstimator, src: Path, dst: Path) -> None:
         cap.release()
 
 
-def run(src: Path, dst: Path, estimator: PoseEstimator) -> None:
+def run(src: Path, dst: Path, estimator: PoseEstimator | YoloPoseEstimator) -> None:
     if src.is_dir():
         run_directory(estimator, src, dst)
     elif src.suffix.lower() in IMAGE_SUFFIXES:
@@ -264,6 +316,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("dst", type=Path, help="output .json, .jsonl, or directory (see module docs)")
     parser.add_argument("--threshold", type=float, default=0.5, help="minimum person score (default: 0.5)")
     parser.add_argument(
+        "--backend",
+        choices=["yolo", "rtdetr"],
+        default="yolo",
+        help="yolo: Ultralytics pose model, runs on MPS/CUDA (default); rtdetr: pictograph ONNX model",
+    )
+    parser.add_argument(
+        "--weights", default="yolo11m-pose.pt", help="YOLO pose weights, used with --backend yolo"
+    )
+    parser.add_argument("--device", default=None, help="yolo device: mps, cuda, or cpu (default: mps if available)")
+    parser.add_argument(
         "--all-people",
         dest="boxers_only",
         action="store_false",
@@ -274,7 +336,12 @@ def main(argv: list[str] | None = None) -> None:
     if not args.src.exists():
         parser.error(f"source does not exist: {args.src}")
 
-    estimator = PoseEstimator.from_hub(threshold=args.threshold, boxers_only=args.boxers_only)
+    if args.backend == "yolo":
+        estimator = YoloPoseEstimator(
+            weights=args.weights, threshold=args.threshold, device=args.device, boxers_only=args.boxers_only
+        )
+    else:
+        estimator = PoseEstimator.from_hub(threshold=args.threshold, boxers_only=args.boxers_only)
     run(args.src, args.dst, estimator)
 
 

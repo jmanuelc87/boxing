@@ -100,6 +100,7 @@ uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq-test 
 | `--max-size`     |     640 | resize so the longest image side is this many pixels     |
 | `--val-fraction` |     0.2 | fraction of tasks held out for validation                |
 | `--seed`         |       0 | seed for the train/val split                             |
+| `--seq-len`      |      16 | frames per clip (also written to `labels.json`)          |
 | `--test`         |     off | small end-to-end run: 3 tasks, first 5 clips of each     |
 
 The clip length is `SEQ_LEN = 16` in `preprocess.py` (0.32 s at 50 fps). Punch tracks last 4 frames at the median, 12 at the 99th percentile and 19 at most, so 16 frames hold almost every punch plus context on both sides.
@@ -179,21 +180,20 @@ Pass `id2label` to `build_model(..., id2label=...)` so saved models carry the cl
 
 ### Loading clips
 
-`src/boxing/dataset.py` loads the clips for PyTorch. `BoxingDetector` takes single images, so `flatten_clips` turns a batch of clips into a batch of frames:
+`src/boxing/dataset.py` loads the clips for PyTorch. `BoxingDetector` takes a clip directly, so the batch keeps its clip structure and the targets stay nested (one list of 16 frame targets per clip). The model flattens them itself, as the training notebook does:
 
 ```python
 from pathlib import Path
 from torch.utils.data import DataLoader
-from boxing.dataset import PunchSequenceDataset, collate_clips, flatten_clips
+from boxing.dataset import PunchSequenceDataset, collate_clips
 
 ds = PunchSequenceDataset(Path("data/processed/punch-seq"), "train")   # x: (16, 3, 640, 640)
 dl = DataLoader(ds, batch_size=2, shuffle=True, collate_fn=collate_clips)
-for x, targets in dl:                       # x: (B, 16, 3, 640, 640)
-    x, targets = flatten_clips(x, targets)   # x: (B*16, 3, 640, 640), 16*B target dicts
+for x, targets in dl:                       # x: (B, 16, 3, 640, 640); targets: B lists of 16 dicts
     loss = model(pixel_values=x, labels=targets).loss
 ```
 
-A batch of `B` clips is `16 × B` images, so use a much smaller batch size than for single frames.
+A batch of `B` clips is `16 × B` frames, so use a much smaller batch size than for single frames. `flatten_clips` (same module) turns a clip batch into a flat batch of frames. Use it only if you feed the model single images yourself.
 
 ## Model
 
@@ -238,12 +238,54 @@ A single image (`pixel_values.dim() == 4`) takes the plain, untouched RT-DETRv2 
 
 Build with `temporal=False` to skip `TemporalFusion` and treat a clip's frames independently (equivalent to `flatten_clips`, but without a second code path).
 
+## Inference
+
+`src/boxing/infer.py` runs a trained checkpoint on a stream of frames. The model needs a full 16-frame clip, so `PunchDetector` keeps a rolling buffer of the last `seq_len` frames and runs the model once the buffer is full.
+
+```python
+import cv2
+from boxing.infer import PunchDetector
+
+det = PunchDetector.from_pretrained("outputs/boxing-detector", stride=2)
+cap = cv2.VideoCapture(0)              # a camera index, a video file or an RTSP URL
+while True:
+    ok, frame = cap.read()             # BGR, as OpenCV returns it
+    if not ok:
+        break
+    pred = det.push(frame)             # None until a clip is ready, and between strided runs
+    if pred is not None:
+        for d in pred.detections:      # sorted by score, highest first
+            print(pred.frame_index, d.label, round(d.score, 2), d.box)  # box = (x1, y1, x2, y2) in pixels
+```
+
+| argument | default | meaning |
+|----------|--------:|---------|
+| `stride` | 1 | run the model every N frames once the buffer is full (`stride=1` runs on every frame) |
+| `score_thresh` | 0.3 | minimum sigmoid score for a detection to be returned |
+| `image_size` | 640 | square size each frame is resized to; must match training |
+| `seq_len` | 16 | frames per clip; must match `labels.json` in the processed dataset |
+| `device` | auto | `mps`, `cuda` or `cpu`, chosen from what is available |
+
+`PunchDetector(model, id2label, ...)` takes any `BoxingDetector`, so you can use a model you have not saved yet.
+
+What `push` does, and what it returns:
+
+- **Preprocessing** matches training: BGR is converted to RGB, the frame is stretched to `image_size` × `image_size` (no letterboxing), and it is normalised with ImageNet mean and std.
+- **Which frame gets the predictions.** Training clips are centred on the punch, so predictions are read from the centre frame of the buffer. The `Prediction.frame_index` is the 0-based index, in push order, of that frame. This adds about `seq_len / 2` frames (0.16 s at 50 fps) of latency.
+- **Boxes** are returned in pixels of the original frame, clipped to its edges. The frame itself is not returned, so keep your own copy to draw on.
+- **Scores** are per class and sigmoid-based, so one query can match more than one class. Each query contributes its best class only.
+
+Call `det.reset()` when the stream jumps or restarts, so the buffer does not mix frames from before and after the jump.
+
+Compute: each run processes all `seq_len` frames through the backbone, so per-frame work is about `seq_len` times a single image. Raise `stride` to trade responsiveness for speed.
+
 ## Run in Colab
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jmanuelc87/boxing/blob/main/notebooks/train.ipynb)
 
 1. Open the badge above, then **Runtime → Change runtime type → GPU**.
-2. Create a `.env` file from `.env.example` and upload it to `MyDrive/boxing/.env` in Google Drive. It needs `KAGGLE_API_TOKEN` (or `KAGGLE_USERNAME` and `KAGGLE_KEY`) and `WANDB_API_KEY`.
-3. Run the notebook from top to bottom. The first cell mounts Drive and clones this repo to `/content/boxing`. The download and preprocessing cells fetch the dataset and build `data/processed/punch`.
+2. Run the first cell. It clones this repo to `/content/boxing`.
+3. Create a `.env` file from `.env.example` and upload it to `/content/boxing/.env` with the Colab Files panel. It needs `KAGGLE_API_TOKEN` (or `KAGGLE_USERNAME` and `KAGGLE_KEY`) and `WANDB_API_KEY`. The `.env` must be uploaded after the first cell, because the clone creates that folder.
+4. Run the remaining cells from top to bottom. The download and preprocessing cells fetch the dataset and build `data/processed/punch-seq`.
 
-Data and checkpoints are written to the Colab VM and are lost when the runtime resets. Only `.env` is read from Drive.
+Data and checkpoints are written to the Colab VM and are lost when the runtime resets. The notebook does not mount Google Drive.

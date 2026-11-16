@@ -157,3 +157,13 @@ One JSON object per line, one line per annotated frame:
 Pass `id2label` to `build_model(..., id2label=...)` so saved models carry the class names.
 
 Labels are per-punch boxes, not per-clip, so they fit the detector. A video-level classifier would need a different target.
+
+## Run in Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jmanuelc87/boxing/blob/main/notebooks/train.ipynb)
+
+1. Open the badge above, then **Runtime → Change runtime type → GPU**.
+2. Create a `.env` file from `.env.example` and upload it to `MyDrive/boxing/.env` in Google Drive. It needs `KAGGLE_API_TOKEN` (or `KAGGLE_USERNAME` and `KAGGLE_KEY`) and `WANDB_API_KEY`.
+3. Run the notebook from top to bottom. The first cell mounts Drive and clones this repo to `/content/boxing`. The download and preprocessing cells fetch the dataset and build `data/processed/punch`.
+
+Data and checkpoints are written to the Colab VM and are lost when the runtime resets. Only `.env` is read from Drive.

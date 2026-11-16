@@ -34,3 +34,7 @@ dev = [
     "matplotlib>=3.11.2",
     "pytest>=9.2.0",
 ]
+export = [
+    "onnx>=1.23.2",
+    "onnxruntime>=1.32.0",
+]

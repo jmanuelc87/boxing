@@ -317,7 +317,7 @@ def preprocess(
     src: Path,
     dst: Path,
     max_size: int = 640,
-    val_fraction: float = 0.2,
+    val_fraction: float = 0.05,
     seed: int = 0,
     test: bool = False,
     seq_len: int = SEQ_LEN,

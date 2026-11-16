@@ -279,6 +279,24 @@ Call `det.reset()` when the stream jumps or restarts, so the buffer does not mix
 
 Compute: each run processes all `seq_len` frames through the backbone, so per-frame work is about `seq_len` times a single image. Raise `stride` to trade responsiveness for speed.
 
+### TensorRT on a Jetson
+
+A TensorRT engine only runs on the GPU and TensorRT version that built it, so convert in two steps:
+
+```bash
+# 1. anywhere with the checkpoint (needs the export group: uv sync --group export)
+uv run python -m boxing.infer export-onnx outputs/boxing-detector model.onnx
+
+# 2. on the Jetson, using JetPack's tensorrt (copy model.onnx and model.labels.json over)
+python3 -m boxing.infer build-engine model.onnx model.engine --fp16
+```
+
+```python
+det = PunchDetector.from_engine("model.engine", stride=2)   # same push() API
+```
+
+The engine has a fixed input of `(1, seq_len, 3, image_size, image_size)`, read from the export, so `from_engine` takes `seq_len` and `image_size` from the engine. Use `--seq-len` / `--image-size` on `export-onnx` to change them. `--fp16` is usually the right choice on Jetson; leave it off to compare accuracy against FP32. ONNX outputs were checked against PyTorch: the same detections come back, though the order of the queries can differ, which `decode` does not depend on.
+
 ## Run in Colab
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jmanuelc87/boxing/blob/main/notebooks/train.ipynb)

@@ -1,4 +1,4 @@
-"""Convert the raw CVAT punch dataset into a normalised detection dataset.
+"""Convert the raw CVAT punch dataset into a dataset of fixed-length frame clips.
 
 Input (``src``): one folder per task, each with ``annotations.json`` (CVAT video
 1.1 JSON) and ``data/<video>.mp4``. See README.md for the annotation format.
@@ -6,28 +6,37 @@ Input (``src``): one folder per task, each with ``annotations.json`` (CVAT video
 Output (``dst``)::
 
     dst/
-    ├── labels.json              # {"names": [...], "id2label": {...}, "label2id": {...}}
+    ├── labels.json              # {"names", "id2label", "label2id", "seq_len"}
     ├── images/<task>/<frame>.jpg
-    ├── train.jsonl              # one record per annotated frame
+    ├── train.jsonl              # one record per clip
     └── val.jsonl
 
+Each punch track becomes one clip of ``SEQ_LEN`` consecutive frames centred on
+the track, so the clip also holds context frames before and after the punch.
 Each JSONL record::
 
-    {"image": "images/<task>/<frame>.jpg", "width": W, "height": H,
-     "class_labels": [0, 3], "boxes": [[cx, cy, w, h], ...]}
+    {"task": "<task>", "track": 12, "label": 2, "start": 647,
+     "width": W, "height": H,
+     "frames": [{"image": "images/<task>/000647.jpg",
+                 "class_labels": [], "boxes": []}, ...]}
+
+``frames`` has exactly ``SEQ_LEN`` entries in frame order. Every frame lists the
+boxes of all tracks visible on it (not only the clip's own track), so a frame
+where two punches overlap carries both; a frame with no punch has empty lists.
+``track`` (index in the task's annotations), ``label`` (that track's class id)
+and ``start`` (first frame number) are metadata.
 
 Boxes are normalised to [0, 1] in ``(cx, cy, w, h)`` order, which is what
 ``RTDetrV2ForObjectDetection`` expects. Images are resized so the longest side
 is ``--max-size`` pixels; normalised boxes are unaffected by that resize.
 
 Track keyframes are linearly interpolated, so every frame between a track's
-first keyframe and its ``outside`` keyframe gets a box. Only frames that contain
-at least one box are written.
+first keyframe and its ``outside`` keyframe gets a box.
 
 Usage::
 
-    uv run python -m boxing.preprocess data/raw/punch data/processed/punch
-    uv run python -m boxing.preprocess data/raw/punch data/processed/punch-test --test   # quick check
+    uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq
+    uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq-test --test   # quick check
 """
 
 from __future__ import annotations
@@ -41,9 +50,13 @@ from pathlib import Path
 import cv2
 from tqdm import tqdm
 
+# Frames per clip: 0.32 s at 50 fps. Punch tracks last 4 frames at the median and
+# at most 19, so 16 frames hold 99% of punches with context on both sides.
+SEQ_LEN = 16
+
 # --test mode: a small end-to-end run (both splits, real decode/resize/write).
 TEST_TASKS = 3
-TEST_FRAMES_PER_TASK = 20
+TEST_CLIPS_PER_TASK = 5
 
 # Class names as they appear in the raw CVAT annotations (Polish). Order is the
 # class id, so the ids are fixed by this list.
@@ -76,6 +89,9 @@ LABELS: list[str] = [
     "Cruzado al cuerpo",  # body, right hand
 ]
 assert len(LABELS) == len(RAW_LABELS)
+
+# One track: (class id, {frame: pixel box [x1, y1, x2, y2]}).
+Track = tuple[int, dict[int, list[float]]]
 
 
 def interpolate_track(shapes: list[dict]) -> dict[int, list[float]]:
@@ -112,17 +128,46 @@ def to_normalised_cxcywh(points: list[float], width: int, height: int) -> list[f
     return [(x1 / width + w / 2), (y1 / height + h / 2), w, h]
 
 
-def collect_task(task_dir: Path) -> dict[int, list[tuple[int, list[float]]]]:
-    """Return {frame: [(class_id, pixel_box), ...]} for one task."""
+def collect_tracks(task_dir: Path) -> list[Track]:
+    """Return one (class_id, {frame: pixel_box}) per track, in annotation order.
+
+    Tracks with no visible frame (only an ``outside`` keyframe) are kept as an
+    empty dict so that the list index stays the track's index in the file.
+    """
     data = json.loads((task_dir / "annotations.json").read_text(encoding="utf-8"))
-    frames: dict[int, list[tuple[int, list[float]]]] = defaultdict(list)
+    tracks: list[Track] = []
     for track in data[0]["tracks"]:
         cls = RAW_LABEL2ID.get(track["label"])
         if cls is None:
             raise ValueError(f"{task_dir.name}: unknown label {track['label']!r}")
-        for frame, box in interpolate_track(track["shapes"]).items():
+        tracks.append((cls, interpolate_track(track["shapes"])))
+    return tracks
+
+
+def merge_tracks(tracks: list[Track]) -> dict[int, list[tuple[int, list[float]]]]:
+    """Return {frame: [(class_id, pixel_box), ...]}: every box visible on each frame."""
+    frames: dict[int, list[tuple[int, list[float]]]] = defaultdict(list)
+    for cls, boxes in tracks:
+        for frame, box in boxes.items():
             frames[frame].append((cls, box))
     return frames
+
+
+def collect_task(task_dir: Path) -> dict[int, list[tuple[int, list[float]]]]:
+    """Return {frame: [(class_id, pixel_box), ...]} for one task."""
+    return merge_tracks(collect_tracks(task_dir))
+
+
+def clip_window(first: int, last: int, seq_len: int, n_frames: int) -> int:
+    """Return the start frame of a ``seq_len`` clip centred on frames [first, last].
+
+    The clip is shifted to stay inside the video ([0, n_frames)). A track longer
+    than ``seq_len`` keeps only its centre ``seq_len`` frames.
+    """
+    if n_frames < seq_len:
+        raise ValueError(f"video has {n_frames} frames, fewer than seq_len={seq_len}")
+    start = (first + last) // 2 - seq_len // 2
+    return min(max(start, 0), n_frames - seq_len)
 
 
 def extract_frames(
@@ -172,52 +217,84 @@ def process_task(
     task_dir: Path,
     dst: Path,
     max_size: int,
-    src_size: tuple[int, int],
-    max_frames: int | None = None,
+    video_meta: tuple[int, int, int],
+    seq_len: int = SEQ_LEN,
+    max_clips: int | None = None,
     show_progress: bool = True,
-) -> list[dict]:
-    """Extract frames and build JSONL records for one task.
+) -> tuple[list[dict], int]:
+    """Extract clip frames and build one JSONL record per track for one task.
 
-    ``max_frames`` keeps only the first N annotated frames (used by ``--test``).
+    ``video_meta`` is ``(width, height, n_frames)`` of the source video.
+    ``max_clips`` keeps only the first N tracks (used by ``--test``).
+
+    Returns (records, number of clips dropped because the video is shorter
+    than the annotations).
     """
-    frames = collect_task(task_dir)
-    if max_frames is not None:
-        frames = {f: frames[f] for f in sorted(frames)[:max_frames]}
+    src_w, src_h, n_frames = video_meta
+    tracks = collect_tracks(task_dir)
+    per_frame = merge_tracks(tracks)
+
+    clips: list[tuple[int, int, int]] = []  # (track index, class id, start frame)
+    dropped = 0
+    for i, (cls, boxes) in enumerate(tracks):
+        if not boxes:
+            continue  # track has no visible frame
+        if min(boxes) >= n_frames:
+            dropped += 1  # annotated past the end of the video
+            continue
+        start = clip_window(min(boxes), max(boxes), seq_len, n_frames)
+        clips.append((i, cls, start))
+    if max_clips is not None:
+        clips = clips[:max_clips]
+
+    wanted = {start + k for _, _, start in clips for k in range(seq_len)}
     video = next((task_dir / "data").glob("*.mp4"))
     rel_dir = Path("images") / task_dir.name
-    sizes = extract_frames(video, set(frames), dst / rel_dir, max_size, task_dir.name if show_progress else None)
+    sizes = extract_frames(video, wanted, dst / rel_dir, max_size, task_dir.name if show_progress else None)
 
     records = []
-    for frame in sorted(frames):
-        if frame not in sizes:
-            continue  # video ended early; nothing to label
-        tw, th = sizes[frame]
-        src_w, src_h = src_size
-        boxes, classes = [], []
-        for cls, pts in frames[frame]:
-            nb = to_normalised_cxcywh(pts, src_w, src_h)
-            if nb is not None:
-                boxes.append(nb)
-                classes.append(cls)
-        if not boxes:
+    for track, cls, start in clips:
+        frame_ids = range(start, start + seq_len)
+        if any(f not in sizes for f in frame_ids):
+            dropped += 1  # the video ended before the clip did
             continue
+        frames = []
+        for f in frame_ids:
+            boxes, classes = [], []
+            for c, pts in per_frame.get(f, []):
+                nb = to_normalised_cxcywh(pts, src_w, src_h)
+                if nb is not None:
+                    boxes.append(nb)
+                    classes.append(c)
+            frames.append({"image": (rel_dir / f"{f:06d}.jpg").as_posix(), "class_labels": classes, "boxes": boxes})
+        tw, th = sizes[start]
         records.append(
             {
-                "image": (rel_dir / f"{frame:06d}.jpg").as_posix(),
+                "task": task_dir.name,
+                "track": track,
+                "label": cls,
+                "start": start,
                 "width": tw,
                 "height": th,
-                "class_labels": classes,
-                "boxes": boxes,
+                "frames": frames,
             }
         )
-    return records
+    return records, dropped
 
 
-def source_size(video: Path) -> tuple[int, int]:
+def video_info(video: Path) -> tuple[int, int, int]:
+    """Return (width, height, frame count) of ``video``."""
     cap = cv2.VideoCapture(str(video))
-    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    return w, h
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"cannot open {video}")
+        return (
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+        )
+    finally:
+        cap.release()
 
 
 def split_tasks(tasks: list[Path], val_fraction: float, seed: int) -> tuple[list[Path], list[Path]]:
@@ -243,33 +320,39 @@ def preprocess(
     val_fraction: float = 0.2,
     seed: int = 0,
     test: bool = False,
+    seq_len: int = SEQ_LEN,
+    show_progress: bool = True,
 ) -> None:
     """Run the full pipeline. With ``test=True``, process only a small sample.
 
     Test mode runs every stage (split, decode, resize, write, JSONL, labels) on
     ``TEST_TASKS`` tasks spread across the dataset and the first
-    ``TEST_FRAMES_PER_TASK`` annotated frames of each, so it finishes quickly.
+    ``TEST_CLIPS_PER_TASK`` clips of each, so it finishes quickly.
     """
     tasks = sorted(p for p in src.iterdir() if (p / "annotations.json").is_file())
     if not tasks:
         raise FileNotFoundError(f"no task folders with annotations.json under {src}")
-    max_frames = None
+    max_clips = None
     if test:
         tasks = tasks[:: max(1, len(tasks) // TEST_TASKS)][:TEST_TASKS]
-        max_frames = TEST_FRAMES_PER_TASK
+        max_clips = TEST_CLIPS_PER_TASK
         val_fraction = max(val_fraction, 1 / len(tasks)) if len(tasks) > 1 else 0.0
-        print(f"[test] {len(tasks)} tasks, up to {max_frames} frames each")
+        print(f"[test] {len(tasks)} tasks, up to {max_clips} clips each")
     dst.mkdir(parents=True, exist_ok=True)
 
-    sizes = {t.name: source_size(next((t / "data").glob("*.mp4"))) for t in tasks}
+    meta = {t.name: video_info(next((t / "data").glob("*.mp4"))) for t in tasks}
 
     train_tasks, val_tasks = split_tasks(tasks, val_fraction, seed)
     for split, group in (("train", train_tasks), ("val", val_tasks)):
         records: list[dict] = []
-        for task in tqdm(group, desc=split, unit="task"):
-            records.extend(process_task(task, dst, max_size, sizes[task.name], max_frames))
+        dropped = 0
+        for task in tqdm(group, desc=split, unit="task", disable=not show_progress):
+            recs, d = process_task(task, dst, max_size, meta[task.name], seq_len, max_clips, show_progress)
+            records.extend(recs)
+            dropped += d
         write_jsonl(dst / f"{split}.jsonl", records)
-        print(f"[{split}] {len(records)} frames from {len(group)} tasks")
+        note = f", {dropped} dropped (video shorter than annotations)" if dropped else ""
+        print(f"[{split}] {len(records)} clips of {seq_len} frames from {len(group)} tasks{note}")
 
     (dst / "labels.json").write_text(
         json.dumps(
@@ -277,6 +360,7 @@ def preprocess(
                 "names": LABELS,
                 "id2label": {str(i): n for i, n in enumerate(LABELS)},
                 "label2id": {name: i for i, name in enumerate(LABELS)},
+                "seq_len": seq_len,
             },
             ensure_ascii=False,
             indent=2,
@@ -293,12 +377,26 @@ def main() -> None:
     parser.add_argument("--val-fraction", type=float, default=0.2, help="fraction of tasks held out (default 0.2)")
     parser.add_argument("--seed", type=int, default=0, help="seed for the task split (default 0)")
     parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=SEQ_LEN,
+        help=f"frames per clip (default {SEQ_LEN})",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
-        help=f"quick end-to-end run: {TEST_TASKS} tasks, {TEST_FRAMES_PER_TASK} frames each",
+        help=f"quick end-to-end run: {TEST_TASKS} tasks, {TEST_CLIPS_PER_TASK} clips each",
     )
     args = parser.parse_args()
-    preprocess(args.src, args.dst, args.max_size, args.val_fraction, args.seed, args.test)
+    preprocess(
+        args.src,
+        args.dst,
+        args.max_size,
+        args.val_fraction,
+        args.seed,
+        args.test,
+        seq_len=args.seq_len,
+    )
 
 
 if __name__ == "__main__":

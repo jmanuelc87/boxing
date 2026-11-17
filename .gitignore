@@ -225,5 +225,6 @@ __marimo__/
 # Data
 data/
 outputs/
+runs/
 # Weights & Biases local run files
 wandb/

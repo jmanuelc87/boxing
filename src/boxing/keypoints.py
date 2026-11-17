@@ -3,7 +3,7 @@
 The model is an RF-DETR keypoint detector published as ONNX, so it runs through
 ONNX Runtime rather than ``transformers``.
 
-    python -m boxing.keypoints SRC DST [--threshold 0.5] [--role-model PATH] [--all-people] [--color-rules]
+    python -m boxing.keypoints SRC DST [--threshold 0.5] [--role-model PATH] [--all-people] [--color-rules] [--workers N]
 
 By default each person is classified by the trained role model (``role_model.pt`` from
 ``boxing.train_role_classifier``, default ``data/processed/role-classifier/role_model.pt``) and
@@ -23,6 +23,10 @@ SRC is an image, a directory of images, a dataset root, or a video:
 Each record lists the detected people. A person has a pixel box ``[x1, y1, x2, y2]``,
 a detection ``score``, and 17 keypoints ``{"name", "x", "y", "score"}`` in COCO order.
 
+``--workers N`` (directory and dataset sources only) runs N worker processes, each with its own copy of the
+model; ``0`` uses every core. It pays off on the CPU; on a single GPU (MPS/CUDA) the workers share the device
+and mostly add memory use, so keep N small there.
+
 Weights are downloaded from the Hugging Face Hub on first use and cached. The model
 is licensed for non-commercial use only; see the model card.
 """
@@ -31,6 +35,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -276,7 +283,37 @@ def dataset_images(root: Path) -> list[Path]:
     return [Path(p) for p in seen]
 
 
-def run_directory(estimator: PoseEstimator, src: Path, dst: Path) -> None:
+_WORKER_ESTIMATOR: PoseEstimator | YoloPoseEstimator | None = None
+
+
+def _init_worker(spec: dict) -> None:
+    """Build this worker's own estimator once, and keep each worker to one CPU thread."""
+    global _WORKER_ESTIMATOR
+    cv2.setNumThreads(1)
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+    except ImportError:
+        pass
+    _WORKER_ESTIMATOR = build_estimator(**spec)
+
+
+def _worker_image(job: tuple[Path, Path]) -> None:
+    src, dst = job
+    try:
+        run_image(_WORKER_ESTIMATOR, src, dst)
+    except SystemExit as exc:  # SystemExit would kill the worker instead of reporting the error
+        raise RuntimeError(str(exc)) from None
+
+
+def run_directory(
+    estimator: PoseEstimator | YoloPoseEstimator | None,
+    src: Path,
+    dst: Path,
+    workers: int = 1,
+    spec: dict | None = None,
+) -> None:
     if is_dataset(src):
         images = [src / rel for rel in dataset_images(src)]
         missing = [p for p in images if not p.is_file()]
@@ -286,9 +323,19 @@ def run_directory(estimator: PoseEstimator, src: Path, dst: Path) -> None:
         images = sorted(p for p in src.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
     if not images:
         raise SystemExit(f"no images found under {src}")
-    for path in tqdm(images, unit="img"):
-        out = (dst / path.relative_to(src)).with_suffix(".json")
-        run_image(estimator, path, out)
+    jobs = [(path, (dst / path.relative_to(src)).with_suffix(".json")) for path in images]
+    n_workers = (os.cpu_count() or 1) if workers == 0 else max(1, workers)
+    if n_workers > 1 and spec is not None and len(jobs) > 1:
+        # spawn, not fork: forking after torch/CUDA/ONNX Runtime has started threads is unsafe
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=n_workers, mp_context=ctx, initializer=_init_worker, initargs=(spec,)
+        ) as pool:
+            for _ in tqdm(pool.map(_worker_image, jobs, chunksize=8), total=len(jobs), unit="img"):
+                pass
+    else:
+        for path, out in tqdm(jobs, unit="img"):
+            run_image(estimator, path, out)
 
 
 def run_video(estimator: PoseEstimator, src: Path, dst: Path) -> None:
@@ -315,12 +362,41 @@ def run_video(estimator: PoseEstimator, src: Path, dst: Path) -> None:
         cap.release()
 
 
-def run(src: Path, dst: Path, estimator: PoseEstimator | YoloPoseEstimator) -> None:
+def build_estimator(
+    backend: str = "yolo",
+    weights: str = "yolo11m-pose.pt",
+    threshold: float = 0.5,
+    device: str | None = None,
+    boxers_only: bool = True,
+    role_model_path: Path | None = None,
+) -> PoseEstimator | YoloPoseEstimator:
+    """Build an estimator from plain, picklable settings, so a worker process can build its own."""
+    role_model = None
+    if boxers_only and role_model_path is not None:
+        from boxing.train_role_classifier import RoleClassifier
+
+        role_model = RoleClassifier(role_model_path)
+    if backend == "yolo":
+        return YoloPoseEstimator(
+            weights=weights, threshold=threshold, device=device, boxers_only=boxers_only, role_model=role_model
+        )
+    return PoseEstimator.from_hub(threshold=threshold, boxers_only=boxers_only, role_model=role_model)
+
+
+def run(
+    src: Path,
+    dst: Path,
+    estimator: PoseEstimator | YoloPoseEstimator | None,
+    workers: int = 1,
+    spec: dict | None = None,
+) -> None:
     if src.is_dir():
-        run_directory(estimator, src, dst)
+        run_directory(estimator, src, dst, workers, spec)
     elif src.suffix.lower() in IMAGE_SUFFIXES:
         run_image(estimator, src, dst)
     elif src.suffix.lower() in VIDEO_SUFFIXES:
+        if workers != 1:
+            print("--workers has no effect on a video (frames are processed in order); running in one process")
         run_video(estimator, src, dst)
     else:
         raise SystemExit(f"unsupported source: {src}")
@@ -348,6 +424,12 @@ def main(argv: list[str] | None = None) -> None:
         help="trained role model used as the boxer filter (default: %(default)s)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="worker processes for directory/dataset sources, each with its own model; 0 = all cores (default 1)",
+    )
+    parser.add_argument(
         "--color-rules",
         action="store_true",
         help="filter by torso colour rules instead of the role model",
@@ -363,27 +445,24 @@ def main(argv: list[str] | None = None) -> None:
     if not args.src.exists():
         parser.error(f"source does not exist: {args.src}")
 
-    role_model = None
+    role_model_path = None
     if args.boxers_only and not args.color_rules:
         if not args.role_model.exists():
             parser.error(f"role model not found: {args.role_model} (train one, or pass --color-rules)")
-        from boxing.train_role_classifier import RoleClassifier
+        role_model_path = args.role_model
 
-        role_model = RoleClassifier(args.role_model)
-
-    if args.backend == "yolo":
-        estimator = YoloPoseEstimator(
-            weights=args.weights,
-            threshold=args.threshold,
-            device=args.device,
-            boxers_only=args.boxers_only,
-            role_model=role_model,
-        )
-    else:
-        estimator = PoseEstimator.from_hub(
-            threshold=args.threshold, boxers_only=args.boxers_only, role_model=role_model
-        )
-    run(args.src, args.dst, estimator)
+    spec = dict(
+        backend=args.backend,
+        weights=args.weights,
+        threshold=args.threshold,
+        device=args.device,
+        boxers_only=args.boxers_only,
+        role_model_path=role_model_path,
+    )
+    parallel = args.workers != 1 and args.src.is_dir()
+    # Parallel workers each build their own estimator, so the parent skips loading one.
+    estimator = None if parallel else build_estimator(**spec)
+    run(args.src, args.dst, estimator, args.workers, spec if parallel else None)
 
 
 if __name__ == "__main__":

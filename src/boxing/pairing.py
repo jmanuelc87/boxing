@@ -23,7 +23,9 @@ Outputs in ``--dst``:
 Usage:
     python -m boxing.pairing --src data/processed/punch-seq \\
         --keypoints data/processed/punch-keypoints-boxers/images \\
-        --dst data/processed/punch-pairs
+        --dst data/processed/punch-pairs [--workers N]
+
+``--workers N`` pairs clips in N processes (``0`` = every core); the output is identical to a single process.
 """
 
 from __future__ import annotations
@@ -31,8 +33,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -173,15 +178,21 @@ def pair_record(rec: dict, kp_root: Path) -> tuple[np.ndarray, dict]:
     return window, meta
 
 
-def process_split(src: Path, kp_root: Path, split: str, dst: Path) -> Counter:
+def process_split(src: Path, kp_root: Path, split: str, dst: Path, workers: int = 1) -> Counter:
     records = [json.loads(line) for line in (src / f"{split}.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     T = len(records[0]["frames"]) if records else 0
     X = np.zeros((len(records), 2, T, NUM_KEYPOINTS, 3), dtype=np.float32)
     y = np.zeros(len(records), dtype=np.int64)
     metas = []
     quality = Counter()
-    for i, rec in enumerate(records):
-        window, meta = pair_record(rec, kp_root)
+    n_workers = (os.cpu_count() or 1) if workers == 0 else max(1, workers)
+    if n_workers > 1 and len(records) > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            # map keeps clip order, so X, y and the metadata stay aligned
+            results = list(pool.map(partial(pair_record, kp_root=kp_root), records, chunksize=16))
+    else:
+        results = [pair_record(rec, kp_root) for rec in records]
+    for i, (rec, (window, meta)) in enumerate(zip(records, results)):
         X[i] = window
         y[i] = rec["label"]
         metas.append(meta)
@@ -204,6 +215,7 @@ def main() -> None:
     parser.add_argument("--keypoints", type=Path, default=Path("data/processed/punch-keypoints-boxers/images"), help="root of the per-frame keypoint JSONs")
     parser.add_argument("--dst", type=Path, default=Path("data/processed/punch-pairs"), help="output directory (created if missing)")
     parser.add_argument("--splits", nargs="+", default=list(SPLITS), choices=SPLITS)
+    parser.add_argument("--workers", type=int, default=1, help="processes pairing clips in parallel; 0 = all cores (default 1)")
     args = parser.parse_args()
 
     if not args.src.is_dir():
@@ -214,7 +226,7 @@ def main() -> None:
     args.dst.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.src / "labels.json", args.dst / "labels.json")
     for split in args.splits:
-        process_split(args.src, args.keypoints, split, args.dst)
+        process_split(args.src, args.keypoints, split, args.dst, args.workers)
 
 
 if __name__ == "__main__":

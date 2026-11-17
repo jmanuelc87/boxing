@@ -36,14 +36,19 @@ Usage::
 
     uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq
     uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq-test --test   # quick check
+    uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq --workers 0   # all cores
+
+``--workers N`` decodes N tasks (videos) in parallel, one process each; ``0`` uses every core.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -296,6 +301,17 @@ def video_info(video: Path) -> tuple[int, int, int]:
         cap.release()
 
 
+def _task_job(job: tuple) -> tuple[list[dict], int]:
+    """``process_task`` with one picklable argument, for use in a worker process."""
+    task_dir, video_meta, dst, max_size, seq_len, max_clips = job
+    return process_task(task_dir, dst, max_size, video_meta, seq_len, max_clips, show_progress=False)
+
+
+def resolve_workers(workers: int) -> int:
+    """``0`` means every core; anything below 1 otherwise is a single process."""
+    return (os.cpu_count() or 1) if workers == 0 else max(1, workers)
+
+
 def split_tasks(tasks: list[Path], val_fraction: float, seed: int) -> tuple[list[Path], list[Path]]:
     """Split by task (recording session), never by frame, to avoid leakage."""
     if not 0 <= val_fraction < 1:
@@ -321,6 +337,7 @@ def preprocess(
     test: bool = False,
     seq_len: int = SEQ_LEN,
     show_progress: bool = True,
+    workers: int = 1,
 ) -> None:
     """Run the full pipeline. With ``test=True``, process only a small sample.
 
@@ -345,10 +362,19 @@ def preprocess(
     for split, group in (("train", train_tasks), ("val", val_tasks)):
         records: list[dict] = []
         dropped = 0
-        for task in tqdm(group, desc=split, unit="task", disable=not show_progress):
-            recs, d = process_task(task, dst, max_size, meta[task.name], seq_len, max_clips, show_progress)
-            records.extend(recs)
-            dropped += d
+        n_workers = min(resolve_workers(workers), len(group))
+        if n_workers > 1:
+            jobs = [(t, meta[t.name], dst, max_size, seq_len, max_clips) for t in group]
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                results = pool.map(_task_job, jobs)  # keeps task order, so output is deterministic
+                for recs, d in tqdm(results, total=len(jobs), desc=split, unit="task", disable=not show_progress):
+                    records.extend(recs)
+                    dropped += d
+        else:
+            for task in tqdm(group, desc=split, unit="task", disable=not show_progress):
+                recs, d = process_task(task, dst, max_size, meta[task.name], seq_len, max_clips, show_progress)
+                records.extend(recs)
+                dropped += d
         write_jsonl(dst / f"{split}.jsonl", records)
         note = f", {dropped} dropped (video shorter than annotations)" if dropped else ""
         print(f"[{split}] {len(records)} clips of {seq_len} frames from {len(group)} tasks{note}")
@@ -382,6 +408,12 @@ def main() -> None:
         help=f"frames per clip (default {SEQ_LEN})",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="processes decoding tasks in parallel; 0 = all cores (default 1)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help=f"quick end-to-end run: {TEST_TASKS} tasks, {TEST_CLIPS_PER_TASK} clips each",
@@ -395,6 +427,7 @@ def main() -> None:
         args.seed,
         args.test,
         seq_len=args.seq_len,
+        workers=args.workers,
     )
 
 

@@ -1,6 +1,6 @@
 """Export one image crop per detected person, ready for labelling in Label Studio.
 
-    python -m boxing.person_crops KEYPOINTS IMAGES DST [--pad 0.1] [--min-size 16]
+    python -m boxing.person_crops KEYPOINTS IMAGES DST [--pad 0.1] [--min-size 16] [--workers N]
 
 KEYPOINTS is a directory of per-frame ``.json`` files from ``boxing.keypoints`` laid out
 as ``<task>/<frame>.json`` (e.g. ``data/processed/punch-keypoints/images``). IMAGES holds
@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from pathlib import Path
 
 import cv2
@@ -55,6 +58,74 @@ def padded_box(box: list[float], pad: float, width: int, height: int) -> tuple[i
     )
 
 
+def process_frame(
+    json_path: Path,
+    images: Path,
+    dst: Path,
+    pad: float,
+    min_size: int,
+    ls_root: Path,
+    prelabel: bool,
+    http_base: str,
+) -> tuple[list[dict], list[dict], list[dict], int, int]:
+    """Write the crops of one frame. Returns (records, tasks, http_tasks, skipped_frames, skipped_people)."""
+    records: list[dict] = []
+    tasks: list[dict] = []
+    http_tasks: list[dict] = []
+    task, frame = json_path.parent.name, json_path.stem
+    image_path = find_image(images, task, frame)
+    image = cv2.imread(str(image_path)) if image_path else None
+    if image is None:
+        return records, tasks, http_tasks, 1, 0
+    height, width = image.shape[:2]
+
+    skipped_people = 0
+    people = json.loads(json_path.read_text(encoding="utf-8"))["people"]
+    for index, person in enumerate(people):
+        x1, y1, x2, y2 = padded_box(person["box"], pad, width, height)
+        if min(x2 - x1, y2 - y1) < min_size:
+            skipped_people += 1
+            continue
+
+        crop_path = dst / task / f"{frame}_{index:02d}.jpg"
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(crop_path), image[y1:y2, x1:x2])
+
+        rel = crop_path.relative_to(dst).as_posix()
+        records.append(
+            {
+                "crop": rel,
+                "task": task,
+                "frame": frame,
+                "person": index,
+                "box": person["box"],
+                "score": person["score"],
+            }
+        )
+        url = f"/data/local-files/?d={crop_path.relative_to(ls_root).as_posix()}"
+        task_entry: dict = {"data": {"image": url, "task": task, "frame": frame, "person": index}}
+        if prelabel:
+            role = classify_person(image, person)
+            records[-1]["prelabel"] = role
+            task_entry["predictions"] = [
+                {
+                    "model_version": "color-rules-v1",
+                    "score": 0.5,
+                    "result": [
+                        {
+                            "from_name": LS_FROM_NAME,
+                            "to_name": LS_TO_NAME,
+                            "type": "choices",
+                            "value": {"choices": [role]},
+                        }
+                    ],
+                }
+            ]
+        tasks.append(task_entry)
+        http_tasks.append({**task_entry, "data": {**task_entry["data"], "image": f"{http_base.rstrip('/')}/{rel}"}})
+    return records, tasks, http_tasks, 0, skipped_people
+
+
 def export(
     keypoints: Path,
     images: Path,
@@ -66,6 +137,7 @@ def export(
     http_base: str = "http://localhost:8000",
     sample: int = 200,
     seed: int | None = None,
+    workers: int = 1,
 ) -> int:
     ls_root = ls_root or dst
     records: list[dict] = []
@@ -73,59 +145,24 @@ def export(
     http_tasks: list[dict] = []
     skipped_frames = skipped_people = 0
 
-    for json_path in tqdm(sorted(keypoints.glob("*/*.json")), desc="frames"):
-        task, frame = json_path.parent.name, json_path.stem
-        image_path = find_image(images, task, frame)
-        image = cv2.imread(str(image_path)) if image_path else None
-        if image is None:
-            skipped_frames += 1
-            continue
-        height, width = image.shape[:2]
-
-        people = json.loads(json_path.read_text(encoding="utf-8"))["people"]
-        for index, person in enumerate(people):
-            x1, y1, x2, y2 = padded_box(person["box"], pad, width, height)
-            if min(x2 - x1, y2 - y1) < min_size:
-                skipped_people += 1
-                continue
-
-            crop_path = dst / task / f"{frame}_{index:02d}.jpg"
-            crop_path.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(crop_path), image[y1:y2, x1:x2])
-
-            rel = crop_path.relative_to(dst).as_posix()
-            records.append(
-                {
-                    "crop": rel,
-                    "task": task,
-                    "frame": frame,
-                    "person": index,
-                    "box": person["box"],
-                    "score": person["score"],
-                }
-            )
-            url = f"/data/local-files/?d={crop_path.relative_to(ls_root).as_posix()}"
-            task_entry: dict = {"data": {"image": url, "task": task, "frame": frame, "person": index}}
-            if prelabel:
-                role = classify_person(image, person)
-                records[-1]["prelabel"] = role
-                task_entry["predictions"] = [
-                    {
-                        "model_version": "color-rules-v1",
-                        "score": 0.5,
-                        "result": [
-                            {
-                                "from_name": LS_FROM_NAME,
-                                "to_name": LS_TO_NAME,
-                                "type": "choices",
-                                "value": {"choices": [role]},
-                            }
-                        ],
-                    }
-                ]
-            tasks.append(task_entry)
-            http_entry = {**task_entry, "data": {**task_entry["data"], "image": f"{http_base.rstrip('/')}/{rel}"}}
-            http_tasks.append(http_entry)
+    json_paths = sorted(keypoints.glob("*/*.json"))
+    work = partial(
+        process_frame, images=images, dst=dst, pad=pad, min_size=min_size,
+        ls_root=ls_root, prelabel=prelabel, http_base=http_base,
+    )
+    n_workers = (os.cpu_count() or 1) if workers == 0 else max(1, workers)
+    if n_workers > 1 and len(json_paths) > 1:
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            # map keeps frame order, so the output files are identical to a single-process run
+            results = pool.map(work, json_paths, chunksize=32)
+            for r, t, h, sf, sp in tqdm(results, total=len(json_paths), desc="frames"):
+                records += r; tasks += t; http_tasks += h
+                skipped_frames += sf; skipped_people += sp
+    else:
+        for json_path in tqdm(json_paths, desc="frames"):
+            r, t, h, sf, sp = work(json_path)
+            records += r; tasks += t; http_tasks += h
+            skipped_frames += sf; skipped_people += sp
 
     dst.mkdir(parents=True, exist_ok=True)
     with (dst / "crops.jsonl").open("w", encoding="utf-8") as f:
@@ -152,10 +189,11 @@ def main() -> None:
     parser.add_argument("--http-base", default="http://localhost:8000", help="base URL serving DST, for label_studio_tasks_http.json")
     parser.add_argument("--sample", type=int, default=200, help="number of random crops in label_studio_tasks_http.json")
     parser.add_argument("--seed", type=int, default=None, help="random seed for the HTTP task sample")
+    parser.add_argument("--workers", type=int, default=1, help="processes cropping frames in parallel; 0 = all cores (default 1)")
     args = parser.parse_args()
     export(
         args.keypoints, args.images, args.dst, args.pad, args.min_size, args.ls_root,
-        not args.no_prelabel, args.http_base, args.sample, args.seed,
+        not args.no_prelabel, args.http_base, args.sample, args.seed, args.workers,
     )
 
 

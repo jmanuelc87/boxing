@@ -1,104 +1,293 @@
-"""Keypoint punch classifier.
+"""EPAM-Net: pose-driven, attention-guided two-stream network for video action recognition.
 
-`PunchPairClassifier` is a two-stream GRU over attacker and opponent pose keypoints
-(see `boxing.pair_dataset` for the input layout and normalisation).
+Reimplementation of EPAM-Net (Nady et al., Neurocomputing 2025, arXiv:2408.05421) in plain
+PyTorch. The reference code lives in ``ahmed-nady/Multimodal-Action-Recognition`` and depends on
+``mmcv`` and ``mmaction``; this file has no such dependency.
+
+    images     (B, T, 3, H, W)     RGB frames, normalised, e.g. T=16 and 224x224
+    keypoints  (B, P, T, J, 3)     (x, y, score) per joint, x and y in [0, 1] of the same crop
+                                   as ``images`` (x to the right, y down); P=2 boxers, J=17
+
+    model = EPAMNet(num_classes=8)
+    out = model(images, keypoints)         # EPAMOutput(rgb_logits, pose_logits)
+    probs = out.probabilities()            # late fusion of the two streams' class scores
+
+Streams
+-------
+* **Pose stream.** The keypoints are rendered as Gaussian heatmaps, one channel per joint per
+  boxer, ``(B, P*J, T, 56, 56)`` (`keypoints_to_heatmaps`). A small X-ShiftNet (X3D-style
+  inverted-residual blocks, 2D convolutions with a Temporal Shift Module, 3 stages) encodes them
+  to ``(B, 216, T, 7, 7)``.
+* **RGB stream.** An X-ShiftNet-M (4 stages) encodes the frames to ``(B, 432, T, 7, 7)``.
+* **Pose-guided attention.** The pose features give a spatial map (channel max and mean, a 7x7
+  convolution, sigmoid) and a temporal weight (spatial average, a 1-D convolution over time,
+  sigmoid). Their product re-weights the RGB features: ``rgb + rgb * attention``. This points the
+  RGB stream at the key frames and at the regions where the boxers are.
+* **Heads and fusion.** Each stream has its own classifier (the attended RGB features and the
+  pose features). Train both with a classification loss; at inference average their softmax
+  scores.
+
+Differences from the reference
+------------------------------
+The reference samples 48 pose frames and 16 RGB frames and picks every third pose feature to
+match. Here the pose and RGB streams see the same T frames by default, and the pose features are
+strided only when their frame count is a multiple of the RGB one. The reference tracks one
+person's 17 joints. Here the attacker's and opponent's joints are separate channels (34 in all),
+so the pose stream knows which boxer is which. The Gaussian width is not given in the paper text,
+so ``sigma`` defaults to 0.6, the value PoseC3D uses at 56x56.
 """
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-from boxing.pair_dataset import (
-    L_HIP,
-    L_SHOULDER,
-    L_WRIST,
-    NOSE,
-    NUM_JOINTS,
-    R_HIP,
-    R_SHOULDER,
-    R_WRIST,
-    VALID_CONF,
-)
-
-# Per boxer and frame: (x, y, score) per joint, per-joint velocity, wrist-to-target vectors,
-# the hip-centre offset to the other boxer, and a role flag.
-_REL_DIM = 2 * 3 * 2 + 2
-PUNCH_FEATURE_DIM = NUM_JOINTS * 3 + NUM_JOINTS * 2 + _REL_DIM + 1
+NUM_JOINTS = 17
+NUM_PLAYERS = 2
 
 
-def _midpoint(xy: torch.Tensor, score: torch.Tensor, i: int, j: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Midpoint of joints i and j, plus whether both were present. ``xy``: (B, T, J, 2)."""
-    valid = (score[..., i] > VALID_CONF) & (score[..., j] > VALID_CONF)
-    return (xy[..., i, :] + xy[..., j, :]) / 2, valid
+def keypoints_to_heatmaps(
+    keypoints: torch.Tensor, size: int = 56, sigma: float = 0.6, min_score: float = 0.1
+) -> torch.Tensor:
+    """Render keypoints as Gaussian heatmaps (paper Eq. 1), weighted by joint confidence.
 
-
-def stream_features(own: torch.Tensor, other: torch.Tensor, role: float) -> torch.Tensor:
-    """Per-frame features of one boxer seen against the other. Both ``(B, T, 17, 3)``.
-
-    Returns ``(B, T, PUNCH_FEATURE_DIM)``. Anything involving a missing joint is zeroed,
-    so a frame without the opponent contributes no relative signal.
+    ``keypoints``: ``(B, P, T, J, 3)`` with x and y in [0, 1] of the crop. Returns
+    ``(B, P*J, T, size, size)``. Joints with a score at or below ``min_score`` give an empty map.
     """
-    xy, score = own[..., :2], own[..., 2]
-    oxy, oscore = other[..., :2], other[..., 2]
-
-    # Velocity, only where the joint is present on both frames.
-    vel = xy[:, 1:] - xy[:, :-1]
-    both = ((score[:, 1:] > 0) & (score[:, :-1] > 0)).unsqueeze(-1)
-    vel = torch.cat([torch.zeros_like(vel[:, :1]), vel * both], dim=1)
-
-    # Where each wrist is relative to the other boxer's head, shoulders and hips.
-    wrists = xy[..., [L_WRIST, R_WRIST], :]  # (B, T, 2, 2)
-    wrist_ok = score[..., [L_WRIST, R_WRIST]] > VALID_CONF  # (B, T, 2)
-    shoulders, shoulders_ok = _midpoint(oxy, oscore, L_SHOULDER, R_SHOULDER)
-    hips, hips_ok = _midpoint(oxy, oscore, L_HIP, R_HIP)
-    targets = torch.stack([oxy[..., NOSE, :], shoulders, hips], dim=-2)  # (B, T, 3, 2)
-    target_ok = torch.stack([oscore[..., NOSE] > VALID_CONF, shoulders_ok, hips_ok], dim=-1)  # (B, T, 3)
-    vec = targets.unsqueeze(2) - wrists.unsqueeze(3)  # (B, T, 2, 3, 2)
-    ok = (wrist_ok.unsqueeze(-1) & target_ok.unsqueeze(2)).unsqueeze(-1)
-    rel = (vec * ok).flatten(2)
-
-    own_hips, own_hips_ok = _midpoint(xy, score, L_HIP, R_HIP)
-    gap = (hips - own_hips) * (own_hips_ok & hips_ok).unsqueeze(-1)
-
-    role_flag = torch.full_like(score[..., :1], role)
-    return torch.cat([own.flatten(2), vel.flatten(2), rel, gap, role_flag], dim=-1)
+    b, p, t, j, _ = keypoints.shape
+    x = keypoints[..., 0] * size
+    y = keypoints[..., 1] * size
+    score = keypoints[..., 2] * (keypoints[..., 2] > min_score)
+    grid = torch.arange(size, device=keypoints.device, dtype=keypoints.dtype) + 0.5
+    gx = torch.exp(-((grid - x.unsqueeze(-1)) ** 2) / (2 * sigma**2))  # (B, P, T, J, size)
+    gy = torch.exp(-((grid - y.unsqueeze(-1)) ** 2) / (2 * sigma**2))
+    heat = score[..., None, None] * gy[..., :, None] * gx[..., None, :]  # (B, P, T, J, size, size)
+    return heat.permute(0, 1, 3, 2, 4, 5).reshape(b, p * j, t, size, size)
 
 
-class PunchPairClassifier(nn.Module):
-    """Classify a punch from a window of attacker and opponent keypoints.
+class TemporalShift(nn.Module):
+    """Shift a fraction of the channels one frame forward and one backward in time (TSM).
 
-    Input ``x``: ``(B, 2, T, 17, 3)``, row 0 the attacker and row 1 the opponent, normalised by
-    `boxing.pair_dataset.normalize_window`. Output: ``(B, num_classes)`` logits.
-
-    A single bidirectional GRU encodes each boxer, run once per role with shared weights. The two
-    embeddings are fused by an MLP. Each stream also receives the wrist positions relative to the
-    other boxer's head, shoulders and hips, so the model can tell a punch aimed at the opponent
-    from a movement that is not.
+    Costs no parameters or FLOPs. Frames shifted past either end are zero-filled.
     """
 
-    def __init__(self, num_classes: int = 8, hidden: int = 128, layers: int = 2, dropout: float = 0.3):
+    def __init__(self, fold_div: int = 8):
         super().__init__()
-        self.proj = nn.Sequential(nn.LayerNorm(PUNCH_FEATURE_DIM), nn.Linear(PUNCH_FEATURE_DIM, hidden), nn.GELU())
-        self.gru = nn.GRU(
-            hidden, hidden, num_layers=layers, batch_first=True, bidirectional=True,
-            dropout=dropout if layers > 1 else 0.0,
-        )
-        # mean and max pooling over time, each 2 * hidden wide
-        self.embed = nn.Sequential(nn.Linear(4 * hidden, hidden), nn.GELU())
-        self.head = nn.Sequential(
-            nn.Dropout(dropout), nn.Linear(2 * hidden, hidden), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(hidden, num_classes),
-        )
+        self.fold_div = fold_div
 
-    def encode(self, feats: torch.Tensor) -> torch.Tensor:
-        h, _ = self.gru(self.proj(feats))
-        return self.embed(torch.cat([h.mean(dim=1), h.amax(dim=1)], dim=-1))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, C, T, H, W)
+        fold = x.shape[1] // self.fold_div
+        if fold == 0 or x.shape[2] < 2:
+            return x
+        forward_shift = F.pad(x[:, :fold, :-1], (0, 0, 0, 0, 1, 0))
+        backward_shift = F.pad(x[:, fold : 2 * fold, 1:], (0, 0, 0, 0, 0, 1))
+        return torch.cat([forward_shift, backward_shift, x[:, 2 * fold :]], dim=1)
+
+
+class SqueezeExcite3d(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(8, channels // reduction)
+        self.fc1 = nn.Conv3d(channels, hidden, 1)
+        self.fc2 = nn.Conv3d(hidden, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attacker, opponent = x[:, 0], x[:, 1]
-        feats = torch.cat(
-            [stream_features(attacker, opponent, 1.0), stream_features(opponent, attacker, 0.0)], dim=0
+        scale = F.adaptive_avg_pool3d(x, 1)
+        return x * torch.sigmoid(self.fc2(F.relu(self.fc1(scale))))
+
+
+_Size3 = int | tuple[int, int, int]
+
+
+def _conv_bn(
+    in_ch: int, out_ch: int, kernel: _Size3, stride: _Size3 = 1, padding: _Size3 = 0, groups: int = 1
+) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv3d(in_ch, out_ch, kernel, stride=stride, padding=padding, groups=groups, bias=False),
+        nn.BatchNorm3d(out_ch),
+    )
+
+
+class ShiftBlock(nn.Module):
+    """X3D inverted-residual block made 2D: temporal shift, 1x1 expand, 3x3 depthwise, 1x1 project.
+
+    The shift is applied to the residual branch only, so the shortcut keeps the original frames.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int, expand: float, use_se: bool, shift_div: int = 8):
+        super().__init__()
+        inner = int(round(out_ch * expand))
+        self.shift = TemporalShift(shift_div)
+        self.expand = _conv_bn(in_ch, inner, 1)
+        self.depthwise = _conv_bn(inner, inner, (1, 3, 3), stride=(1, stride, stride), padding=(0, 1, 1), groups=inner)
+        self.se = SqueezeExcite3d(inner) if use_se else nn.Identity()
+        self.project = _conv_bn(inner, out_ch, 1)
+        self.shortcut = (
+            _conv_bn(in_ch, out_ch, 1, stride=(1, stride, stride)) if stride != 1 or in_ch != out_ch else nn.Identity()
         )
-        att_emb, opp_emb = self.encode(feats).chunk(2, dim=0)
-        return self.head(torch.cat([att_emb, opp_emb], dim=-1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.relu(self.expand(self.shift(x)))
+        y = F.silu(self.se(self.depthwise(y)))
+        y = self.project(y)
+        return F.relu(y + self.shortcut(x))
+
+
+class XShiftNet(nn.Module):
+    """X3D-style backbone with 2D convolutions and temporal shift ("X-ShiftNet").
+
+    ``stage_blocks`` and ``stage_channels`` give the blocks and the output width of each stage. The
+    first block of every stage halves the spatial size. A final 1x1 convolution widens the last
+    stage by ``expand``, so the output has ``round(stage_channels[-1] * expand)`` channels. The stem
+    has no temporal convolution and the frame count is never reduced.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        stage_blocks: tuple[int, ...],
+        stage_channels: tuple[int, ...],
+        stem_stride: int,
+        expand: float = 2.25,
+    ):
+        super().__init__()
+        if len(stage_blocks) != len(stage_channels):
+            raise ValueError("stage_blocks and stage_channels must have the same length")
+        stem_ch = stage_channels[0]
+        self.stem = nn.Sequential(
+            _conv_bn(in_channels, stem_ch, (1, 3, 3), stride=(1, stem_stride, stem_stride), padding=(0, 1, 1)),
+            nn.ReLU(inplace=True),
+        )
+        stages, in_ch = [], stem_ch
+        for blocks, out_ch in zip(stage_blocks, stage_channels):
+            layers = []
+            for i in range(blocks):
+                # X3D puts squeeze-and-excitation on every other block ("half" style).
+                layers.append(ShiftBlock(in_ch, out_ch, stride=2 if i == 0 else 1, expand=expand, use_se=(i + 1) % 2 == 0))
+                in_ch = out_ch
+            stages.append(nn.Sequential(*layers))
+        self.stages = nn.Sequential(*stages)
+        self.out_channels = int(round(stage_channels[-1] * expand))
+        self.conv5 = nn.Sequential(_conv_bn(in_ch, self.out_channels, 1), nn.ReLU(inplace=True))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, C, T, H, W) -> (B, C', T, H', W')
+        return self.conv5(self.stages(self.stem(x)))
+
+
+class PoseGuidedAttention(nn.Module):
+    """Nested spatial and temporal attention computed from the pose features.
+
+    Spatial: channel-wise max and mean, a 1x7x7 convolution, sigmoid, giving ``(B, 1, T, H, W)``.
+    Temporal: the spatial map averaged over H and W, a 1-D convolution over time, sigmoid, giving
+    ``(B, 1, T, 1, 1)``. The output is their product, in [0, 1].
+    """
+
+    def __init__(self, kernel: int = 7):
+        super().__init__()
+        self.spatial = nn.Sequential(
+            nn.Conv3d(2, 1, (1, kernel, kernel), padding=(0, kernel // 2, kernel // 2), bias=False),
+            nn.BatchNorm3d(1),
+        )
+        self.temporal = nn.Conv1d(1, 1, kernel, padding=kernel // 2, bias=False)
+
+    def forward(self, pose_feats: torch.Tensor) -> torch.Tensor:  # (B, C, T, H, W)
+        b, _, t, _, _ = pose_feats.shape
+        pooled = torch.cat([pose_feats.amax(dim=1, keepdim=True), pose_feats.mean(dim=1, keepdim=True)], dim=1)
+        spatial = torch.sigmoid(self.spatial(pooled))  # (B, 1, T, H, W)
+        temporal = torch.sigmoid(self.temporal(spatial.mean(dim=(3, 4)).reshape(b, 1, t)))
+        return spatial * temporal.reshape(b, 1, t, 1, 1)
+
+
+class ClassifierHead(nn.Module):
+    """Dropout, global average pooling and one linear layer."""
+
+    def __init__(self, in_channels: int, num_classes: int, dropout: float = 0.5):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(in_channels, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.dropout(F.adaptive_avg_pool3d(x, 1).flatten(1)))
+
+
+class EPAMOutput(NamedTuple):
+    rgb_logits: torch.Tensor  # attended RGB stream, (B, num_classes)
+    pose_logits: torch.Tensor  # pose stream, (B, num_classes)
+
+    def probabilities(self, rgb_weight: float = 0.5) -> torch.Tensor:
+        """Late fusion: weighted mean of the two streams' softmax scores."""
+        return rgb_weight * self.rgb_logits.softmax(-1) + (1 - rgb_weight) * self.pose_logits.softmax(-1)
+
+
+class EPAMNet(nn.Module):
+    """Two-stream RGB + pose network with pose-guided attention. See the module docstring.
+
+    Args:
+        num_classes: number of punch classes.
+        heatmap_size: side of the pose heatmaps in pixels (56 pairs with 224x224 RGB, both ending
+            at a 7x7 feature map).
+        sigma: Gaussian width of a joint in heatmap pixels.
+        min_score: joints at or below this confidence are left out of the heatmaps.
+        rgb_blocks / pose_blocks: blocks per stage of each stream. The defaults are X3D-M (3, 5,
+            11, 7) for RGB and its last three stages (5, 11, 7) for pose.
+        dropout: dropout before each classifier.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 8,
+        heatmap_size: int = 56,
+        sigma: float = 0.6,
+        min_score: float = 0.1,
+        rgb_blocks: tuple[int, ...] = (3, 5, 11, 7),
+        pose_blocks: tuple[int, ...] = (5, 11, 7),
+        rgb_channels: tuple[int, ...] = (24, 48, 96, 192),
+        pose_channels: tuple[int, ...] = (24, 48, 96),
+        dropout: float = 0.5,
+    ):
+        super().__init__()
+        self.heatmap_size, self.sigma, self.min_score = heatmap_size, sigma, min_score
+        self.rgb_backbone = XShiftNet(3, rgb_blocks, rgb_channels, stem_stride=2)
+        self.pose_backbone = XShiftNet(NUM_PLAYERS * NUM_JOINTS, pose_blocks, pose_channels, stem_stride=1)
+        self.attention = PoseGuidedAttention()
+        self.rgb_head = ClassifierHead(self.rgb_backbone.out_channels, num_classes, dropout)
+        self.pose_head = ClassifierHead(self.pose_backbone.out_channels, num_classes, dropout)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Conv3d, nn.Conv1d)):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.01)
+                nn.init.zeros_(m.bias)
+
+    @staticmethod
+    def _align_pose(pose_feats: torch.Tensor, rgb_feats: torch.Tensor) -> torch.Tensor:
+        """Match the pose features to the RGB features in frames (by striding) and in space."""
+        t_pose, t_rgb = pose_feats.shape[2], rgb_feats.shape[2]
+        if t_pose != t_rgb:
+            if t_pose % t_rgb:
+                raise ValueError(f"pose frames ({t_pose}) must be a multiple of RGB frames ({t_rgb})")
+            pose_feats = pose_feats[:, :, :: t_pose // t_rgb]
+        if pose_feats.shape[3:] != rgb_feats.shape[3:]:
+            pose_feats = F.adaptive_avg_pool3d(pose_feats, rgb_feats.shape[2:])
+        return pose_feats
+
+    def forward(self, images: torch.Tensor, keypoints: torch.Tensor) -> EPAMOutput:
+        """``images``: (B, T, 3, H, W). ``keypoints``: (B, 2, T_pose, 17, 3), x and y in [0, 1]."""
+        rgb_feats = self.rgb_backbone(images.permute(0, 2, 1, 3, 4))  # (B, C, T, H', W')
+        heatmaps = keypoints_to_heatmaps(keypoints, self.heatmap_size, self.sigma, self.min_score)
+        pose_feats = self.pose_backbone(heatmaps)
+
+        attention = self.attention(self._align_pose(pose_feats, rgb_feats))  # (B, 1, T, H', W')
+        guided = rgb_feats + rgb_feats * attention
+        return EPAMOutput(self.rgb_head(guided), self.pose_head(pose_feats))

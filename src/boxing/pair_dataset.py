@@ -117,6 +117,8 @@ class PunchPairDataset(Dataset):
         wanted = {"good"} if quality == "good" else {"good", "partial"}
         keep = np.array([m["quality"] in wanted for m in meta], dtype=bool)
         self.meta = [m for m, k in zip(meta, keep) if k]
+        # Position of each kept window in the split's full .npz order, to align side features.
+        self.indices = np.flatnonzero(keep)
         self.X = np.stack([normalize_window(w) for w in data["X"][keep]]) if keep.any() else np.zeros((0, 2, 0, NUM_JOINTS, 3), np.float32)
         self.y = data["y"][keep].astype(np.int64)
         self.augment = augment

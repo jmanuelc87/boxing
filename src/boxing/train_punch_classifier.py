@@ -116,14 +116,6 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, n_class
     }
 
 
-def lr_factor(step: int, total_steps: int, warmup_steps: int, floor: float = 0.01) -> float:
-    """Linear warm-up, then cosine decay to ``floor`` of the base learning rate."""
-    if step < warmup_steps:
-        return (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
-
-
 def model_card(names: list[str], args: argparse.Namespace, best_epoch: int, result: dict, n_params: int) -> str:
     """README.md for the Hub repo: what the model is, how to load it, and the validation scores."""
     fused = result["fused"]
@@ -318,7 +310,11 @@ def main() -> None:
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(args.warmup_epochs * steps_per_epoch))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: lr_factor(s, total_steps, warmup_steps))
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / warmup_steps, end_factor=1.0, total_iters=warmup_steps)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.01 * args.lr
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
 
     out_dir.mkdir(parents=True, exist_ok=True)
     best_dir, ckpt_dir = out_dir / "best", out_dir / "checkpoint"

@@ -3,12 +3,13 @@
 The model is an RF-DETR keypoint detector published as ONNX, so it runs through
 ONNX Runtime rather than ``transformers``.
 
-    python -m boxing.keypoints SRC DST [--threshold 0.5] [--all-people]
+    python -m boxing.keypoints SRC DST [--threshold 0.5] [--role-model PATH] [--all-people] [--color-rules]
 
-By default people are classified by torso colour (see ``boxing.color_roles``) and only the
-red and blue boxers are kept; referees, audience and anyone else are dropped from every
-frame. Pass ``--all-people`` to keep everyone. The colour rules are heuristics, so check the
-output on your footage.
+By default each person is classified by the trained role model (``role_model.pt`` from
+``boxing.train_role_classifier``, default ``data/processed/role-classifier/role_model.pt``) and
+only the red and blue boxers are kept; referees, audience and anyone else are dropped from every
+frame. Pass ``--color-rules`` to use the torso-colour heuristics (``boxing.color_roles``) instead,
+or ``--all-people`` to keep everyone.
 
 SRC is an image, a directory of images, a dataset root, or a video:
 
@@ -42,6 +43,7 @@ from tqdm import tqdm
 from boxing.color_roles import classify_person
 
 BOXER_ROLES = {"boxer_red", "boxer_blue"}
+DEFAULT_ROLE_MODEL = Path("data/processed/role-classifier/role_model.pt")
 
 REPO_ID = "pictograph/pg-coco-pose"
 ONNX_FILE = "pg-coco-pose.onnx"
@@ -121,9 +123,18 @@ def decode(
     return people
 
 
-def keep_boxers(image_bgr: np.ndarray, people: list[Person]) -> list[Person]:
-    """Drop everyone whose torso colour is not a red or blue boxer (referee, audience, ...)."""
-    return [p for p in people if classify_person(image_bgr, asdict(p)) in BOXER_ROLES]
+def keep_boxers(image_bgr: np.ndarray, people: list[Person], role_model=None) -> list[Person]:
+    """Drop everyone who is not a red or blue boxer (referee, audience, ...).
+
+    ``role_model`` is a ``boxing.train_role_classifier.RoleClassifier``; without one, the
+    torso-colour rules decide.
+    """
+    if not people:
+        return people
+    if role_model is None:
+        return [p for p in people if classify_person(image_bgr, asdict(p)) in BOXER_ROLES]
+    roles = role_model.classify(image_bgr, [p.box for p in people])
+    return [p for p, role in zip(people, roles) if role in BOXER_ROLES]
 
 
 class PoseEstimator:
@@ -134,12 +145,14 @@ class PoseEstimator:
         threshold: float = 0.5,
         providers: list[str] | None = None,
         boxers_only: bool = False,
+        role_model=None,
     ):
         config = json.loads(Path(config_path).read_text(encoding="utf-8"))["_pictograph"]
         self.input_h, self.input_w = config["input_shape"]
         self.names: list[str] = config["class_names"]
         self.threshold = threshold
         self.boxers_only = boxers_only
+        self.role_model = role_model
 
         available = ort.get_available_providers()
         if providers is None:
@@ -148,12 +161,13 @@ class PoseEstimator:
         self.input_name = self.session.get_inputs()[0].name
 
     @classmethod
-    def from_hub(cls, threshold: float = 0.5, boxers_only: bool = False) -> PoseEstimator:
+    def from_hub(cls, threshold: float = 0.5, boxers_only: bool = False, role_model=None) -> PoseEstimator:
         return cls(
             hf_hub_download(REPO_ID, ONNX_FILE),
             hf_hub_download(REPO_ID, CONFIG_FILE),
             threshold=threshold,
             boxers_only=boxers_only,
+            role_model=role_model,
         )
 
     def preprocess(self, image_bgr: np.ndarray) -> np.ndarray:
@@ -168,7 +182,7 @@ class PoseEstimator:
         raw = self.session.run(None, {self.input_name: self.preprocess(image_bgr)})
         outputs = {o.name: r for o, r in zip(self.session.get_outputs(), raw)}
         people = decode(outputs, self.names, width, height, self.threshold)
-        return keep_boxers(image_bgr, people) if self.boxers_only else people
+        return keep_boxers(image_bgr, people, self.role_model) if self.boxers_only else people
 
 
 COCO_NAMES = [
@@ -191,6 +205,7 @@ class YoloPoseEstimator:
         threshold: float = 0.5,
         device: str | None = None,
         boxers_only: bool = False,
+        role_model=None,
     ):
         import torch
         from ultralytics import YOLO
@@ -201,6 +216,7 @@ class YoloPoseEstimator:
         self.device = device
         self.threshold = threshold
         self.boxers_only = boxers_only
+        self.role_model = role_model
 
     def predict(self, image_bgr: np.ndarray) -> list[Person]:
         result = self.model.predict(image_bgr, device=self.device, conf=self.threshold, verbose=False)[0]
@@ -220,7 +236,7 @@ class YoloPoseEstimator:
             ]
             people.append(Person(box=[float(v) for v in box], score=float(score), keypoints=joints))
 
-        return keep_boxers(image_bgr, people) if self.boxers_only else people
+        return keep_boxers(image_bgr, people, self.role_model) if self.boxers_only else people
 
 
 def record(people: list[Person], width: int, height: int) -> dict:
@@ -326,22 +342,47 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--device", default=None, help="yolo device: mps, cuda, or cpu (default: mps if available)")
     parser.add_argument(
+        "--role-model",
+        type=Path,
+        default=DEFAULT_ROLE_MODEL,
+        help="trained role model used as the boxer filter (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--color-rules",
+        action="store_true",
+        help="filter by torso colour rules instead of the role model",
+    )
+    parser.add_argument(
         "--all-people",
         dest="boxers_only",
         action="store_false",
-        help="keep everyone; by default only red/blue boxers (by torso colour) are kept",
+        help="keep everyone; by default only red/blue boxers are kept",
     )
     args = parser.parse_args(argv)
 
     if not args.src.exists():
         parser.error(f"source does not exist: {args.src}")
 
+    role_model = None
+    if args.boxers_only and not args.color_rules:
+        if not args.role_model.exists():
+            parser.error(f"role model not found: {args.role_model} (train one, or pass --color-rules)")
+        from boxing.train_role_classifier import RoleClassifier
+
+        role_model = RoleClassifier(args.role_model)
+
     if args.backend == "yolo":
         estimator = YoloPoseEstimator(
-            weights=args.weights, threshold=args.threshold, device=args.device, boxers_only=args.boxers_only
+            weights=args.weights,
+            threshold=args.threshold,
+            device=args.device,
+            boxers_only=args.boxers_only,
+            role_model=role_model,
         )
     else:
-        estimator = PoseEstimator.from_hub(threshold=args.threshold, boxers_only=args.boxers_only)
+        estimator = PoseEstimator.from_hub(
+            threshold=args.threshold, boxers_only=args.boxers_only, role_model=role_model
+        )
     run(args.src, args.dst, estimator)
 
 

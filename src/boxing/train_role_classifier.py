@@ -1,16 +1,13 @@
 """Baseline role classifier trained on hand labels exported from Label Studio.
 
-    uv run python -m boxing.train_role_classifier EXPORT.json CROPS_DIR [--keypoints DIR]
+    uv run python -m boxing.train_role_classifier EXPORT.json CROPS_DIR
         [--holdout TASK] [--out DIR]
 
 EXPORT.json is the JSON export of the labeled project. CROPS_DIR is the output of
-``boxing.person_crops`` (it holds the crop images). KEYPOINTS is the directory of
-per-frame keypoint JSONs (``data/processed/punch-keypoints/images``), used to locate each
-person's torso so the colour features match the colour rules.
+``boxing.person_crops`` (it holds the crop images).
 
-Each labeled crop is described by a pretrained Model embedding plus the four torso colour
-fractions (red, blue, white, black). A linear head is trained on the standardised features.
-The head is also trained on embeddings alone so the effect of the colour features is visible.
+Each labeled crop is described by a pretrained timm embedding. A linear head is trained on the
+standardised embeddings, and the backbone is also fine-tuned end to end.
 
 The held-out task is a whole task folder, so the score reflects a new camera/session rather
 than near-duplicate frames. The colour rules are scored on the same crops for comparison.
@@ -26,17 +23,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import timm
 import torch
 import torch.nn as nn
 from PIL import Image
-from torchvision import models
 
-from boxing.color_roles import colour_fractions, torso_roi
 from boxing.person_crops import padded_box
 
 ROLES = ["boxer_red", "boxer_blue", "referee", "other"]
-CROP_PAD = 0.1  # must match the --pad used by boxing.person_crops (its default)
-COLOUR_KEYS = ("red", "blue", "white", "black")
 
 
 def load_labels(export_path: Path, crops_dir: Path) -> list[dict]:
@@ -79,35 +73,10 @@ def load_labels(export_path: Path, crops_dir: Path) -> list[dict]:
     return items
 
 
-def colour_features(item: dict, keypoints_dir: Path) -> list[float]:
-    """Torso colour fractions measured inside the crop, using the same torso region as the rules."""
-    rec = json.loads(
-        (keypoints_dir / item["task"] / f"{item['frame']}.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    frame_h, frame_w = rec["height"], rec["width"]
-    person = rec["people"][item["person"]]
-
-    # Torso in full-frame pixels, then shifted into the crop's coordinate system.
-    x1, y1, x2, y2 = torso_roi(person, frame_h, frame_w)
-    ox, oy, _, _ = padded_box(person["box"], CROP_PAD, frame_w, frame_h)
-    crop = cv2.imread(str(item["path"]))
-    ch, cw = crop.shape[:2]
-    cx1, cy1 = max(0, x1 - ox), max(0, y1 - oy)
-    cx2, cy2 = min(cw, x2 - ox), min(ch, y2 - oy)
-    if cx2 <= cx1 or cy2 <= cy1:  # torso outside the crop: no colour evidence
-        return [0.0] * len(COLOUR_KEYS)
-    fractions = colour_fractions(crop[cy1:cy2, cx1:cx2])
-    return [fractions[k] for k in COLOUR_KEYS]
-
-
 def embed(paths: list[Path], device: torch.device) -> torch.Tensor:
-    weights = models.ResNet18_Weights.IMAGENET1K_V1
-    backbone = models.resnet18(weights=weights)
-    backbone.fc = nn.Identity()
+    backbone, _ = build_backbone("resnet18")
     backbone.eval().to(device)
-    preprocess = weights.transforms()
+    preprocess = backbone_transform("resnet18")
 
     feats = []
     with torch.no_grad():
@@ -150,45 +119,84 @@ def evaluate(
         return head(x[test_idx]).argmax(dim=1).tolist()
 
 
-class FineTuner(nn.Module):
-    """ResNet-101 backbone (trainable) with the colour features concatenated before the head.
+BACKBONES = (
+    "resnet18",
+    "resnet34",
+    "resnet50",
+    "resnet101",
+    "efficientnet_b0",
+    "efficientnet_b1",
+    "efficientnet_b2",
+    "efficientnet_b3",
+    "efficientnet_b4",
+)
 
-    torchvision has no ResNet-108; ResNet-101 is the nearest available depth.
+
+def build_backbone(name: str) -> tuple[nn.Module, int]:
+    """Pretrained timm backbone with the classifier removed; returns (model, pooled feature dim)."""
+    model = timm.create_model(name, pretrained=True, num_classes=0)  # pooled features
+    return model, model.num_features
+
+
+def backbone_transform(name: str):
+    """Preprocessing that matches the pretrained weights of a timm backbone."""
+    model = timm.create_model(name, pretrained=True, num_classes=0)
+    return timm.data.create_transform(**timm.data.resolve_data_config(model=model))
+
+
+class FineTuner(nn.Module):
+    """Trainable backbone (selected by name) with a linear role head on its pooled features."""
+
+    def __init__(self, backbone: str):
+        super().__init__()
+        self.backbone, dim = build_backbone(backbone)
+        self.head = nn.Linear(dim, len(ROLES))
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.head(self.backbone(images))
+
+
+class FocalCrossEntropy(nn.Module):
+    """Cross-entropy scaled by (1 - p_t) ** gamma so easy examples contribute less.
+
+    ``weight`` is the per-class weight (as in ``nn.CrossEntropyLoss``); ``gamma=0`` reduces
+    to plain weighted cross-entropy.
     """
 
-    def __init__(self, n_colour: int):
+    def __init__(self, gamma: float = 2.0, weight: torch.Tensor | None = None):
         super().__init__()
-        weights = models.ResNet101_Weights.IMAGENET1K_V2
-        self.backbone = models.resnet101(weights=weights)
-        self.backbone.fc = nn.Identity()  # 2048-d pooled features
-        self.head = nn.Linear(2048 + n_colour, len(ROLES))
+        self.gamma = gamma
+        self.register_buffer("weight", weight)
 
-    def forward(self, images: torch.Tensor, colour: torch.Tensor) -> torch.Tensor:
-        return self.head(torch.cat([self.backbone(images), colour], dim=1))
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        log_p = torch.log_softmax(logits, dim=1)
+        log_pt = log_p.gather(1, target[:, None]).squeeze(1)
+        pt = log_pt.exp()
+        loss = -((1 - pt) ** self.gamma) * log_pt
+        if self.weight is not None:
+            loss = loss * self.weight[target]
+        return loss.mean()
 
 
-def preprocess_images(paths: list[Path]) -> torch.Tensor:
+def preprocess_images(paths: list[Path], backbone: str) -> torch.Tensor:
     """Resize and normalise every crop once, so fine-tuning doesn't re-decode JPEGs each epoch."""
-    preprocess = models.ResNet101_Weights.IMAGENET1K_V2.transforms()
+    preprocess = backbone_transform(backbone)
     return torch.stack([preprocess(Image.open(p).convert("RGB")) for p in paths])
 
 
 def finetune_and_evaluate(
     images: torch.Tensor,
-    colour: torch.Tensor,
     y: torch.Tensor,
     train_idx: list[int],
     test_idx: list[int],
     device: torch.device,
+    backbone: str = "resnet101",
     epochs: int = 8,
     batch_size: int = 32,
+    gamma: float = 2.0,
 ) -> tuple[list[int], dict]:
     """Fine-tune the backbone; return test predictions and the state needed to reload the model."""
-    mean = colour[train_idx].mean(dim=0)
-    std = colour[train_idx].std(dim=0).clamp_min(1e-6)
-    colour = (colour - mean) / std
-
-    model = FineTuner(colour.shape[1]).to(device)
+    model = FineTuner(backbone).to(device)
     backbone_params = list(model.backbone.parameters())
     opt = torch.optim.Adam(
         [
@@ -200,7 +208,7 @@ def finetune_and_evaluate(
     # Inverse-frequency weights so the small "other" class is not ignored.
     counts = torch.bincount(y[train_idx], minlength=len(ROLES)).float().clamp_min(1)
     weights = (counts.sum() / (len(ROLES) * counts)).to(device)
-    loss_fn = nn.CrossEntropyLoss(weight=weights)
+    loss_fn = FocalCrossEntropy(gamma=gamma, weight=weights)
 
     for epoch in range(epochs):
         model.train()
@@ -211,10 +219,10 @@ def finetune_and_evaluate(
             batch = images[idx].to(device)
             if (
                 torch.rand(1).item() < 0.5
-            ):  # horizontal flip only: keeps the colour cues intact
+            ):  # horizontal flip only
                 batch = torch.flip(batch, dims=[3])
             opt.zero_grad()
-            loss = loss_fn(model(batch, colour[idx].to(device)), y[idx].to(device))
+            loss = loss_fn(model(batch), y[idx].to(device))
             loss.backward()
             opt.step()
             total += loss.item() * len(idx)
@@ -225,13 +233,9 @@ def finetune_and_evaluate(
     with torch.no_grad():
         for start in range(0, len(test_idx), 64):
             idx = test_idx[start : start + 64]
-            logits = model(images[idx].to(device), colour[idx].to(device))
+            logits = model(images[idx].to(device))
             preds += logits.argmax(dim=1).cpu().tolist()
-    state = {
-        "model": {k: v.cpu() for k, v in model.state_dict().items()},
-        "colour_mean": mean,
-        "colour_std": std,
-    }
+    state = {"model": {k: v.cpu() for k, v in model.state_dict().items()}}
     return preds, state
 
 
@@ -298,18 +302,50 @@ def report(name: str, truth: list[str], pred: list[str]) -> dict:
     return m
 
 
+class RoleClassifier:
+    """The fine-tuned role model saved by ``main`` (``role_model.pt``), used to classify live people.
+
+    Crops are taken with the same padding ``boxing.person_crops`` used for the training crops.
+    """
+
+    def __init__(self, path: Path, device: torch.device | None = None, pad: float = 0.1):
+        ckpt = torch.load(path, map_location="cpu")
+        if ckpt["roles"] != ROLES:
+            raise ValueError(f"{path} was trained for roles {ckpt['roles']}, expected {ROLES}")
+        self.device = device or torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.model = FineTuner(ckpt["backbone"])
+        self.model.load_state_dict(ckpt["model"])
+        self.model.eval().to(self.device)
+        self.transform = backbone_transform(ckpt["backbone"])
+        self.pad = pad
+
+    @torch.no_grad()
+    def classify(self, image_bgr: np.ndarray, boxes: list[list[float]]) -> list[str]:
+        """Role for each person box ``[x1, y1, x2, y2]``. Empty crops are labelled ``other``."""
+        roles = ["other"] * len(boxes)
+        height, width = image_bgr.shape[:2]
+        tensors, slots = [], []
+        for k, box in enumerate(boxes):
+            x1, y1, x2, y2 = padded_box(box, self.pad, width, height)
+            crop = image_bgr[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            tensors.append(self.transform(Image.fromarray(rgb)))
+            slots.append(k)
+        if tensors:
+            logits = self.model(torch.stack(tensors).to(self.device))
+            for k, idx in zip(slots, logits.argmax(dim=1).tolist()):
+                roles[k] = ROLES[idx]
+        return roles
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("export", type=Path)
     parser.add_argument("crops", type=Path)
-    parser.add_argument(
-        "--keypoints",
-        type=Path,
-        default=Path("data/processed/punch-keypoints/images"),
-        help="directory of <task>/<frame>.json keypoint files",
-    )
     parser.add_argument(
         "--holdout",
         default=None,
@@ -320,6 +356,18 @@ def main() -> None:
         type=int,
         default=0,
         help="random seed for reproducible runs (default: 0)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=8,
+        help="fine-tuning epochs (default: 8)",
+    )
+    parser.add_argument(
+        "--backbone",
+        choices=BACKBONES,
+        default="resnet101",
+        help="timm backbone to fine-tune (default: resnet101)",
     )
     parser.add_argument(
         "--out",
@@ -340,10 +388,6 @@ def main() -> None:
 
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     emb = embed([i["path"] for i in items], device)
-    colour = torch.tensor(
-        [colour_features(i, args.keypoints) for i in items], dtype=torch.float32
-    )
-    both = torch.cat([emb, colour], dim=1)
 
     train_idx = [k for k, i in enumerate(items) if i["task"] != holdout]
     test_idx = [k for k, i in enumerate(items) if i["task"] == holdout]
@@ -362,21 +406,15 @@ def main() -> None:
         "frozen ResNet-18 embeddings", truth, [ROLES[p] for p in pred_idx]
     )
 
+    ft_name = f"fine-tuned {args.backbone}"
+    print(f"\nfine-tuning {args.backbone} end to end...")
     set_seed(args.seed)
-    pred_idx = evaluate(both, y, train_idx, test_idx)
-    results["frozen ResNet-18 + colour"] = report(
-        "frozen ResNet-18 + colour", truth, [ROLES[p] for p in pred_idx]
-    )
-
-    print("\nfine-tuning ResNet-101 end to end...")
-    set_seed(args.seed)
-    images = preprocess_images([i["path"] for i in items])
+    images = preprocess_images([i["path"] for i in items], args.backbone)
     ft_pred, ft_state = finetune_and_evaluate(
-        images, colour, y, train_idx, test_idx, device
+        images, y, train_idx, test_idx, device,
+        backbone=args.backbone, epochs=args.epochs,
     )
-    results["fine-tuned ResNet-101 + colour"] = report(
-        "fine-tuned ResNet-101 + colour", truth, [ROLES[p] for p in ft_pred]
-    )
+    results[ft_name] = report(ft_name, truth, [ROLES[p] for p in ft_pred])
 
     rule_pairs = [
         (items[k]["label"], items[k]["rule"]) for k in test_idx if items[k]["rule"]
@@ -391,11 +429,8 @@ def main() -> None:
         torch.save(
             {
                 "model": ft_state["model"],
-                "backbone": "resnet101",
+                "backbone": args.backbone,
                 "roles": ROLES,
-                "colour_keys": COLOUR_KEYS,
-                "colour_mean": ft_state["colour_mean"],
-                "colour_std": ft_state["colour_std"],
                 "seed": args.seed,
                 "holdout": holdout,
             },

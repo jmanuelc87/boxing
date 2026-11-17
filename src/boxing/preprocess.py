@@ -26,8 +26,7 @@ where two punches overlap carries both; a frame with no punch has empty lists.
 ``track`` (index in the task's annotations), ``label`` (that track's class id)
 and ``start`` (first frame number) are metadata.
 
-Boxes are normalised to [0, 1] in ``(cx, cy, w, h)`` order, which is what
-``RTDetrV2ForObjectDetection`` expects. Images are resized so the longest side
+Boxes are normalised to [0, 1] in ``(cx, cy, w, h)`` order. Images are resized so the longest side
 is ``--max-size`` pixels; normalised boxes are unaffected by that resize.
 
 Track keyframes are linearly interpolated, so every frame between a track's

@@ -4,6 +4,64 @@
 
 *Training clip from `task_kam4_gh099681`: the yellow box marks a "Jab fallido" (left-hand miss).*
 
+## Pipeline
+
+The raw CVAT annotations and videos go through five transformations before a punch is classified. Each stage writes its output to disk, so any one can be rerun on its own.
+
+```mermaid
+flowchart TB
+    raw["Raw data<br/>CVAT tracks + 1920x1080 50 fps video"]
+    clips["Clips<br/>16 frames, 640x360 JPEG,<br/>a punch box and class per frame"]
+    kp["Per-frame keypoints<br/>17 COCO joints per person,<br/>red and blue boxers only"]
+    pairs["Paired windows<br/>(2, 16, 17, 3): attacker, opponent,<br/>pixel x, y, score"]
+    norm["Normalised windows<br/>origin = attacker hip centre,<br/>scale = attacker torso length"]
+    feats["Per-frame features (100 per boxer)<br/>keypoints, velocity, wrist-to-opponent<br/>vectors, hip offset, role flag"]
+    model["Two-stream GRU<br/>shared weights, attacker + opponent"]
+    out["8 punch classes"]
+
+    raw -->|"boxing.preprocess"| clips
+    clips -->|"boxing.keypoints"| kp
+    clips -->|"boxing.pairing"| pairs
+    kp -->|"boxing.pairing"| pairs
+    pairs -->|"pair_dataset.normalize_window"| norm
+    norm -->|"+ mirror, zoom, jitter, joint dropout (train only)"| feats
+    feats --> model --> out
+```
+
+| stage | command | input | output |
+|---|---|---|---|
+| 1. Clips | `boxing.preprocess` | CVAT tracks, MP4 videos | `data/processed/punch-seq/`: 16-frame clips with a box and class per frame |
+| 2. Keypoints | `boxing.keypoints` | the clips' frames | `data/processed/punch-keypoints-boxers/`: one JSON per frame |
+| 3. Pairing | `boxing.pairing` | clips + keypoints | `data/processed/punch-pairs/`: `X` of shape `(N, 2, 16, 17, 3)` |
+| 4. Normalise and augment | `PunchPairDataset` | pixel-space windows | body-relative windows; mirrored and jittered during training |
+| 5. Classify | `boxing.train_punch_classifier` | normalised windows | logits over the 8 classes, plus the best checkpoint |
+
+Steps 4 and 5 run inside one training command. The full sequence:
+
+```bash
+uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq
+uv run python -m boxing.keypoints data/processed/punch-seq data/processed/punch-keypoints-boxers
+uv run python -m boxing.pairing --src data/processed/punch-seq \
+    --keypoints data/processed/punch-keypoints-boxers/images --dst data/processed/punch-pairs
+uv run python -m boxing.train_punch_classifier
+```
+
+### Example: one clip through the first stages
+
+**Stage 1, the clip.** The animation at the top of this page is one clip: 16 frames with the hand-drawn punch box (yellow). The label is the class of the punch in that box.
+
+**Stage 2, keypoints.** The pose model finds 17 joints on every person in the frame, including the referee and the audience:
+
+![Keypoints on everyone in the ring](media/keypoints.gif)
+
+*Skeletons on every detected person. The label is the clip's class (here "Cruzado fallido").*
+
+**Stage 2 with the boxer filter.** The role classifier drops the referee and everyone else, keeping the red and blue boxers. Those two skeletons are what `boxing.pairing` turns into the attacker and the opponent:
+
+![Keypoints on the two boxers only](media/keypoints-two-players.gif)
+
+*Only the two boxers are kept (here "Cruzado al cuerpo").*
+
 ## Dataset: Olympic Boxing Punch Classification Video Dataset
 
 Raw data lives in `data/raw/punch/`. Each of the 29 folders is one recording session:
@@ -161,8 +219,6 @@ One JSON object per line, one line per clip (`frames` shortened here; it always 
 | `frames[].class_labels` | class id for each box on that frame (see the label table)               |
 | `frames[].boxes` | `[cx, cy, w, h]` per box, normalised to `[0, 1]`; same order as `class_labels` |
 
-Each frame's `{"class_labels", "boxes"}` is the target format that `RTDetrV2ForObjectDetection` takes as `labels`.
-
 ### `labels.json`
 
 ```json
@@ -174,136 +230,119 @@ Each frame's `{"class_labels", "boxes"}` is the target format that `RTDetrV2ForO
 }
 ```
 
-`id2label` keys are strings because JSON requires it. `load_id2label` (`src/boxing/dataset.py`) converts them to integers.
+`id2label` keys are strings because JSON requires it. The keypoint pipeline reads `names` from this file.
 
-Pass `id2label` to `build_model(..., id2label=...)` so saved models carry the class names.
 
-### Loading clips
+## Pose keypoints
 
-`src/boxing/dataset.py` loads the clips for PyTorch. `BoxingDetector` takes a clip directly, so the batch keeps its clip structure and the targets stay nested (one list of 16 frame targets per clip). The model flattens them itself, as the training notebook does:
-
-```python
-from pathlib import Path
-from torch.utils.data import DataLoader
-from boxing.dataset import PunchSequenceDataset, collate_clips
-
-ds = PunchSequenceDataset(Path("data/processed/punch-seq"), "train")   # x: (16, 3, 640, 640)
-dl = DataLoader(ds, batch_size=2, shuffle=True, collate_fn=collate_clips)
-for x, targets in dl:                       # x: (B, 16, 3, 640, 640); targets: B lists of 16 dicts
-    loss = model(pixel_values=x, labels=targets).loss
-```
-
-A batch of `B` clips is `16 × B` frames, so use a much smaller batch size than for single frames. `flatten_clips` (same module) turns a clip batch into a flat batch of frames. Use it only if you feed the model single images yourself.
-
-## Model
-
-`BoxingDetector` (`src/boxing/model.py`) is RT-DETRv2 (Hugging Face `RTDetrV2ForObjectDetection`) with a `timm` MobileNet/EfficientNet backbone, plus a causal LSTM that fuses a clip's frames on the coarsest feature map before the (otherwise unmodified) hybrid encoder and decoder:
-
-```mermaid
-flowchart TB
-    single["pixel_values (B, 3, H, W)<br/>one image per batch element"]
-    clip["pixel_values (B, T, 3, H, W)<br/>a 16-frame clip per batch element"]
-
-    single --> backbone
-    clip --> flatten["flatten to (B·T, 3, H, W)"] --> backbone
-
-    subgraph perframe [" per frame, independently "]
-        backbone["timm backbone<br/>(MobileNetV3 / EfficientNet)<br/>strides 8 / 16 / 32"]
-        backbone --> proj["encoder_input_proj<br/>1x1 conv + BN per level<br/>-> d_model channels"]
-    end
-
-    proj -->|"level 0 (stride 8)"| lvl0["feature map (B·T, d, H/8, W/8)"]
-    proj -->|"level 1 (stride 16)"| lvl1["feature map (B·T, d, H/16, W/16)"]
-    proj -->|"level 2 (stride 32, coarsest)"| lvl2["feature map (B·T, d, H/32, W/32)"]
-
-    lvl2 -->|"only when input was a clip"| tf["TemporalFusion<br/>causal LSTM per spatial position,<br/>over the clip's T frames<br/>fused = feat + lstm(feat)"]
-    tf --> enc
-
-    lvl0 --> enc
-    lvl1 --> enc
-    lvl2 -->|"single-image input: no LSTM"| enc
-
-    subgraph rtdetr [" stock RT-DETRv2, unchanged "]
-        enc["hybrid encoder<br/>AIFI self-attention (coarsest level)<br/>+ CCFM cross-scale fusion (FPN + PAN)"]
-        enc --> sel["uncertainty-minimal query selection<br/>top-k encoder tokens -> num_queries"]
-        sel --> dec["deformable-attention decoder<br/>iterative box refinement, decoder_layers layers"]
-        dec --> heads["class_embed (linear) / bbox_embed (MLP)<br/>per decoder layer"]
-    end
-
-    heads --> out["logits (B·T, num_queries, num_labels)<br/>pred_boxes (B·T, num_queries, 4)"]
-    out -.->|"labels given"| loss["Hungarian matching + VFL + L1/GIoU loss<br/>(+ auxiliary loss per decoder layer)"]
-```
-
-A single image (`pixel_values.dim() == 4`) takes the plain, untouched RT-DETRv2 path — no backbone/encoder call is duplicated and the LSTM is never invoked. A clip (`dim() == 5`) is flattened to `B·T` images for the backbone and heads, but the coarsest level's `(B·T, d, h, w)` feature map is reshaped to `(B·h·w, T, d)` so the LSTM sees one sequence of length `T` per spatial position, then reshaped back before being added as a residual. `labels` for a clip is `list[list[dict]]` (length `B`, each length `T`, one target dict per frame — the same `{"class_labels", "boxes"}` shape as the single-image case), flattened in the same `B·T` order as the frames.
-
-Build with `temporal=False` to skip `TemporalFusion` and treat a clip's frames independently (equivalent to `flatten_clips`, but without a second code path).
-
-## Inference
-
-`src/boxing/infer.py` runs a trained checkpoint on a stream of frames. The model needs a full 16-frame clip, so `PunchDetector` keeps a rolling buffer of the last `seq_len` frames and runs the model once the buffer is full.
-
-```python
-import cv2
-from boxing.infer import PunchDetector
-
-det = PunchDetector.from_pretrained("outputs/boxing-detector", stride=2)
-cap = cv2.VideoCapture(0)              # a camera index, a video file or an RTSP URL
-while True:
-    ok, frame = cap.read()             # BGR, as OpenCV returns it
-    if not ok:
-        break
-    pred = det.push(frame)             # None until a clip is ready, and between strided runs
-    if pred is not None:
-        for d in pred.detections:      # sorted by score, highest first
-            print(pred.frame_index, d.label, round(d.score, 2), d.box)  # box = (x1, y1, x2, y2) in pixels
-```
-
-| argument | default | meaning |
-|----------|--------:|---------|
-| `stride` | 1 | run the model every N frames once the buffer is full (`stride=1` runs on every frame) |
-| `score_thresh` | 0.3 | minimum sigmoid score for a detection to be returned |
-| `image_size` | 640 | square size each frame is resized to; must match training |
-| `seq_len` | 16 | frames per clip; must match `labels.json` in the processed dataset |
-| `device` | auto | `mps`, `cuda` or `cpu`, chosen from what is available |
-
-`PunchDetector(model, id2label, ...)` takes any `BoxingDetector`, so you can use a model you have not saved yet.
-
-What `push` does, and what it returns:
-
-- **Preprocessing** matches training: BGR is converted to RGB, the frame is stretched to `image_size` × `image_size` (no letterboxing), and it is normalised with ImageNet mean and std.
-- **Which frame gets the predictions.** Training clips are centred on the punch, so predictions are read from the centre frame of the buffer. The `Prediction.frame_index` is the 0-based index, in push order, of that frame. This adds about `seq_len / 2` frames (0.16 s at 50 fps) of latency.
-- **Boxes** are returned in pixels of the original frame, clipped to its edges. The frame itself is not returned, so keep your own copy to draw on.
-- **Scores** are per class and sigmoid-based, so one query can match more than one class. Each query contributes its best class only.
-
-Call `det.reset()` when the stream jumps or restarts, so the buffer does not mix frames from before and after the jump.
-
-Compute: each run processes all `seq_len` frames through the backbone, so per-frame work is about `seq_len` times a single image. Raise `stride` to trade responsiveness for speed.
-
-### TensorRT on a Jetson
-
-A TensorRT engine only runs on the GPU and TensorRT version that built it, so convert in two steps:
+`boxing.keypoints` runs a COCO pose model over each frame of the processed clips and saves one JSON per frame, mirroring the image paths:
 
 ```bash
-# 1. anywhere with the checkpoint (needs the export group: uv sync --group export)
-uv run python -m boxing.infer export-onnx outputs/boxing-detector model.onnx
-
-# 2. on the Jetson, using JetPack's tensorrt (copy model.onnx and model.labels.json over)
-python3 -m boxing.infer build-engine model.onnx model.engine --fp16
+uv run python -m boxing.keypoints data/processed/punch-seq data/processed/punch-keypoints-boxers
 ```
 
-```python
-det = PunchDetector.from_engine("model.engine", stride=2)   # same push() API
+By default it keeps only the red and blue boxers, using the trained role model (`data/processed/role-classifier/role_model.pt`). Pass `--all-people` to keep everyone, or `--color-rules` to use the torso-colour heuristics. Each person has a pixel box, a score, and 17 COCO keypoints. Weights come from the Hugging Face Hub on first use. The model is licensed for non-commercial use only.
+
+## Paired windows
+
+`boxing.pairing` joins each clip with the keypoints of the boxers in it. For each clip it picks the attacker (the boxer whose glove box contains the punch) and the opponent (the other person nearest the attacker), then follows both through the 16 frames.
+
+```bash
+uv run python -m boxing.pairing \
+    --src data/processed/punch-seq \
+    --keypoints data/processed/punch-keypoints-boxers/images \
+    --dst data/processed/punch-pairs
 ```
 
-The engine has a fixed input of `(1, seq_len, 3, image_size, image_size)`, read from the export, so `from_engine` takes `seq_len` and `image_size` from the engine. Use `--seq-len` / `--image-size` on `export-onnx` to change them. `--fp16` is usually the right choice on Jetson; leave it off to compare accuracy against FP32. ONNX outputs were checked against PyTorch: the same detections come back, though the order of the queries can differ, which `decode` does not depend on.
+Output in `--dst`:
 
-## Run in Colab
+- `train.npz` and `val.npz`: `X` with shape `(N, 2, 16, 17, 3)` (row 0 attacker, row 1 opponent; last axis `x, y, score` in pixels) and `y` with the class id. Missing people are zero-filled with score 0.
+- `train.jsonl` and `val.jsonl`: one metadata row per window, aligned with `X`. Each row has a `quality` field: `good` (attacker and opponent present on every frame), `partial` (some frames without an opponent), or `no_attacker`.
+- `labels.json`: copied from `--src`.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/jmanuelc87/boxing/blob/main/notebooks/train.ipynb)
+Windows from the same fight never appear in both splits. The `good`/`partial` split is a warning, not a filter: most `partial` windows are missing the opponent on a few frames only.
 
-1. Open the badge above, then **Runtime → Change runtime type → GPU**.
-2. Run the first cell. It clones this repo to `/content/boxing`.
-3. Create a `.env` file from `.env.example` and upload it to `/content/boxing/.env` with the Colab Files panel. It needs `KAGGLE_API_TOKEN` (or `KAGGLE_USERNAME` and `KAGGLE_KEY`) and `WANDB_API_KEY`. The `.env` must be uploaded after the first cell, because the clone creates that folder.
-4. Run the remaining cells from top to bottom. The download and preprocessing cells fetch the dataset and build `data/processed/punch-seq`.
+## Punch classifier
 
-Data and checkpoints are written to the Colab VM and are lost when the runtime resets. The notebook does not mount Google Drive.
+`src/boxing/model.py` holds `PunchPairClassifier`, a two-stream bidirectional GRU:
+
+- The attacker and the opponent go through the same GRU, with a role flag so the model knows which is which.
+- Each frame carries the keypoints, their velocities, the wrist-to-opponent vectors (head, shoulders, hips), and the hip offset between the boxers. Missing joints are zeroed.
+- The two embeddings are pooled over time (mean and max) and joined by an MLP into the 8 classes.
+
+`src/boxing/pair_dataset.py` normalises each window to the attacker's hip centre and torso length, so the model sees body-relative motion. Training augmentation mirrors the window (swapping left and right joints, so the class is unchanged), with small scale and position jitter and random joint dropout.
+
+```bash
+uv run python -m boxing.train_punch_classifier            # GRU, weighted cross entropy (default)
+uv run python -m boxing.train_punch_classifier --loss focal --focal-gamma 2   # focal loss, optional
+```
+
+Training uses inverse-square-root class weights and label smoothing 0.05. It stops after 15 epochs without a gain in validation macro F1, and keeps the best checkpoint in `--out` (default `runs/punch-classifier/`), along with `metrics.json` and the confusion matrix.
+
+### Results on the validation fights
+
+Validation has 954 windows from 6 fights, which is a small and noisy test set.
+
+| model | accuracy | macro F1 | notes |
+|---|---:|---:|---|
+| majority class | 0.405 | — | always "Jab a la cabeza" |
+| GRU, cross entropy (default) | 0.433 | 0.334 | best epoch 25 |
+| GRU, focal loss (gamma 2) | 0.376 | 0.313 | |
+| LSTM, focal loss (gamma 2) | 0.373 | 0.302 | |
+| GRU, attacker only | 0.327 | 0.235 | opponent context removed |
+| hand-crafted features + gradient boosting | 0.466 | 0.248 | see below |
+
+Head and body punches are hard to tell apart from these keypoints, and so are hit, miss and block. Jab against cross (which hand) is easier: about 0.78–0.81 accuracy against 0.66 for the majority.
+
+## Hand-crafted baseline
+
+`src/boxing/handcrafted_punch.py` reduces each window to about 160 statistics: wrist speed and extension, elbow angle, wrist-to-opponent distances, closing speed, shoulder and hip rotation, and body movement for both boxers. A gradient-boosting classifier is trained on them with the same split and metrics.
+
+It needs scikit-learn, which is not a project dependency:
+
+```bash
+uv run --with scikit-learn python -m boxing.handcrafted_punch
+```
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+## Label Studio
+
+Hand-label the person crops from `boxing.person_crops` as `boxer_red`, `boxer_blue`, `referee` or `other`.
+
+Install and start Label Studio:
+
+```bash
+pip install label-studio
+label-studio start   # UI at http://localhost:8080
+```
+
+Create a project with this labeling config (Settings → Labeling Interface → Code):
+
+```xml
+<View>
+  <Image name="image" value="$image" maxWidth="600"/>
+  <Choices name="label" toName="image" choice="single" showInline="true" layout="inline">
+    <Choice value="boxer_red"/>
+    <Choice value="boxer_blue"/>
+    <Choice value="referee"/>
+    <Choice value="other"/>
+  </Choices>
+</View>
+```
+
+Serve the data folder over HTTP with CORS so Label Studio can load the images. The task URLs are relative to the export folder, so run the server from the folder that holds `label_studio_tasks_http.json` (`data/processed/punch-crops` if you used the default `DST`), in a second terminal:
+
+```bash
+cd data/processed/punch-crops
+uv run --project ../../.. python -m boxing.serve_cors --port 8000
+```
+
+Then import `label_studio_tasks_http.json` (task image URLs point at `http://localhost:8000/...`). The server binds to `127.0.0.1` by default; pass `--bind 0.0.0.0` only if Label Studio runs on another machine.
+
+Once labelling is done, export the project as JSON and train with `uv run python -m boxing.train_role_classifier EXPORT.json CROPS_DIR`.
+

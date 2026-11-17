@@ -15,17 +15,21 @@ flowchart TB
     kp["Per-frame keypoints<br/>17 COCO joints per person,<br/>red and blue boxers only"]
     pairs["Paired windows<br/>(2, 16, 17, 3): attacker, opponent,<br/>pixel x, y, score"]
     norm["Normalised windows<br/>origin = attacker hip centre,<br/>scale = attacker torso length"]
-    feats["Per-frame features (100 per boxer)<br/>keypoints, velocity, wrist-to-opponent<br/>vectors, hip offset, role flag"]
-    model["Two-stream GRU<br/>shared weights, attacker + opponent"]
-    out["8 punch classes"]
+    crops["RGB crops 224x224<br/>16 frames, one square crop around both boxers"]
+    heat["Pose heatmaps 56x56<br/>34 Gaussian channels per frame"]
+    model["EPAM-Net<br/>RGB and pose streams, pose-guided attention"]
+    out["8 punch classes<br/>fused score of the two streams"]
 
     raw -->|"boxing.preprocess"| clips
     clips -->|"boxing.keypoints"| kp
     clips -->|"boxing.pairing"| pairs
     kp -->|"boxing.pairing"| pairs
     pairs -->|"pair_dataset.normalize_window"| norm
-    norm -->|"+ mirror, zoom, jitter, joint dropout (train only)"| feats
-    feats --> model --> out
+    clips -->|"epam_dataset: crop, resize"| crops
+    kp -->|"epam_dataset: same crop"| heat
+    crops --> model
+    heat --> model
+    model --> out
 ```
 
 | stage | command | input | output |
@@ -33,8 +37,8 @@ flowchart TB
 | 1. Clips | `boxing.preprocess` | CVAT tracks, MP4 videos | `data/processed/punch-seq/`: 16-frame clips with a box and class per frame |
 | 2. Keypoints | `boxing.keypoints` | the clips' frames | `data/processed/punch-keypoints-boxers/`: one JSON per frame |
 | 3. Pairing | `boxing.pairing` | clips + keypoints | `data/processed/punch-pairs/`: `X` of shape `(N, 2, 16, 17, 3)` |
-| 4. Normalise and augment | `PunchPairDataset` | pixel-space windows | body-relative windows; mirrored and jittered during training |
-| 5. Classify | `boxing.train_punch_classifier` | normalised windows | logits over the 8 classes, plus the best checkpoint |
+| 4. Crop and augment | `boxing.epam_dataset` | clips and keypoints | 224×224 RGB frames and keypoints in the same crop; crop, mirror and brightness jitter during training |
+| 5. Classify | `boxing.train_punch_classifier` | crops and keypoints | logits from each stream, fused for the prediction, plus the best checkpoint |
 
 Steps 4 and 5 run inside one training command. The full sequence:
 
@@ -43,7 +47,8 @@ uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq
 uv run python -m boxing.keypoints data/processed/punch-seq data/processed/punch-keypoints-boxers
 uv run python -m boxing.pairing --src data/processed/punch-seq \
     --keypoints data/processed/punch-keypoints-boxers/images --dst data/processed/punch-pairs
-uv run python -m boxing.train_punch_classifier
+uv run python -m boxing.train_punch_classifier --test   # check the pipeline in under a minute
+uv run python -m boxing.train_punch_classifier          # full training run
 ```
 
 ### Example: one clip through the first stages
@@ -262,37 +267,67 @@ Output in `--dst`:
 
 Windows from the same fight never appear in both splits. The `good`/`partial` split is a warning, not a filter: most `partial` windows are missing the opponent on a few frames only.
 
-## Punch classifier
+## Train EPAM-Net
 
-`src/boxing/model.py` holds `PunchPairClassifier`, a two-stream bidirectional GRU:
+`boxing.train_punch_classifier` trains EPAM-Net (`src/boxing/model.py`) on the clips from `boxing.preprocess` and the keypoints from `boxing.pairing`. It needs both the `punch-seq` folder (for the frames) and the `punch-pairs` folder (for the keypoints and labels).
 
-- The attacker and the opponent go through the same GRU, with a role flag so the model knows which is which.
-- Each frame carries the keypoints, their velocities, the wrist-to-opponent vectors (head, shoulders, hips), and the hip offset between the boxers. Missing joints are zeroed.
-- The two embeddings are pooled over time (mean and max) and joined by an MLP into the 8 classes.
+### Test mode first
 
-`src/boxing/pair_dataset.py` normalises each window to the attacker's hip centre and torso length, so the model sees body-relative motion. Training augmentation mirrors the window (swapping left and right joints, so the class is unchanged), with small scale and position jitter and random joint dropout.
+Before a long run, check the whole pipeline on a few windows:
 
 ```bash
-uv run python -m boxing.train_punch_classifier            # GRU, weighted cross entropy (default)
-uv run python -m boxing.train_punch_classifier --loss focal --focal-gamma 2   # focal loss, optional
+uv run python -m boxing.train_punch_classifier --test
 ```
 
-Training uses inverse-square-root class weights and label smoothing 0.05. It stops after 15 epochs without a gain in validation macro F1, and keeps the best checkpoint in `--out` (default `runs/punch-classifier/`), along with `metrics.json` and the confusion matrix.
+Test mode uses 24 training and 16 validation windows, 2 epochs, and the folder `runs/epam-test/`. It runs data loading with augmentation, the forward and backward passes, the learning-rate schedule, validation, saving the checkpoint, reloading it (it fails if the reloaded checkpoint scores differently), and writing `metrics.json`. The numbers it prints are meaningless. Use it after any change to the data, the model or the training loop.
 
-### Results on the validation fights
+### Full run
 
-Validation has 954 windows from 6 fights, which is a small and noisy test set.
+```bash
+uv run python -m boxing.train_punch_classifier
+uv run python -m boxing.train_punch_classifier --epochs 40 --batch-size 8 --lr 0.01 --out runs/epam-run2
+```
 
-| model | accuracy | macro F1 | notes |
-|---|---:|---:|---|
-| majority class | 0.405 | — | always "Jab a la cabeza" |
-| GRU, cross entropy (default) | 0.433 | 0.334 | best epoch 25 |
-| GRU, focal loss (gamma 2) | 0.376 | 0.313 | |
-| LSTM, focal loss (gamma 2) | 0.373 | 0.302 | |
-| GRU, attacker only | 0.327 | 0.235 | opponent context removed |
-| hand-crafted features + gradient boosting | 0.466 | 0.248 | see below |
+| option | default | meaning |
+|---|---:|---|
+| `--pairs` | `data/processed/punch-pairs` | output of `boxing.pairing` |
+| `--src` | `data/processed/punch-seq` | clips and frames from `boxing.preprocess` |
+| `--out` | `runs/epam-net` | where the checkpoint and metrics go |
+| `--epochs` | 30 | training epochs |
+| `--batch-size` | 8 | clips per step |
+| `--lr` | 0.01 | base learning rate (SGD, momentum 0.9) |
+| `--warmup-epochs` | 1 | linear warm-up before the cosine decay |
+| `--weight-decay` | 3e-4 | SGD weight decay |
+| `--loss` | `ce` | `ce` (class-weighted cross entropy) or `focal` (with `--focal-gamma`, default 2) |
+| `--label-smoothing` | 0.05 | smoothing for the cross entropy |
+| `--rgb-weight` | 0.5 | weight of the RGB stream when the two streams' scores are fused |
+| `--patience` | 10 | stop after this many epochs without a gain in validation macro F1 |
+| `--quality` | `all` | `all` keeps every window with an attacker; `good` keeps only windows with both boxers on every frame |
+| `--workers` | 4 | data-loading processes |
+| `--device` | auto | `cuda` or `cpu` (cuda if available) |
+| `--seed` | 0 | random seed |
 
-Head and body punches are hard to tell apart from these keypoints, and so are hit, miss and block. Jab against cross (which hand) is easier: about 0.78–0.81 accuracy against 0.66 for the majority.
+Each epoch prints the training loss, the validation accuracy and macro F1 of the fused prediction, and the macro F1 of each stream alone. A `*` marks a new best. The best checkpoint (scored on validation) is kept.
+
+### Outputs
+
+```
+runs/epam-net/
+├── best.pt         # weights, class names and the fusion weight
+└── metrics.json    # per-epoch history, per-class precision/recall/F1, confusion matrix, arguments
+```
+
+The end of the run reloads `best.pt` into a fresh model and prints the fused confusion matrix, along with the RGB-only and pose-only macro F1.
+
+### Timing
+
+On the CPU, one training step of 4 clips takes about 1.6 s, so an epoch of the full training split takes on the order of 20 minutes. The default is CUDA if available. MPS was slower than the CPU for this model in our measurements. Expect a GPU run to take a fraction of that.
+
+### Inputs and what the model sees
+
+- Each clip is cropped to the square box around all confident keypoints of both boxers, with a 25% margin, and resized to 224×224. The keypoints are rescaled into that same crop.
+- Training adds a random crop zoom (0.9–1.15×) and shift, a horizontal mirror (with left and right joints swapped), and brightness and contrast jitter.
+- The pose stream draws a Gaussian heatmap (σ = 0.6 px at 56×56) for each joint of each boxer.
 
 ## Hand-crafted baseline
 
@@ -307,7 +342,9 @@ uv run --with scikit-learn python -m boxing.handcrafted_punch
 ## Tests
 
 ```bash
-uv run pytest
+uv run pytest                                  # all tests
+uv run pytest tests/test_model.py              # EPAM-Net layers and heatmaps
+uv run pytest tests/test_epam_dataset.py       # crops, augmentation and a training smoke test
 ```
 
 ## Label Studio

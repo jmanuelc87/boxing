@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 
-from boxing.model import PUNCH_FEATURE_DIM, PunchPairClassifier, stream_features
 from boxing.pair_dataset import FLIP_PERM, augment_window, normalize_window
 
 
@@ -37,24 +36,8 @@ def test_augment_keeps_shape_and_is_seeded():
     np.testing.assert_array_equal(a, b)
 
 
-def test_stream_features_shape_and_missing_opponent_is_finite():
-    x = torch.from_numpy(normalize_window(_window()))[None]  # (1, 2, T, 17, 3)
-    x[:, 1] = 0.0  # opponent absent
-    feats = stream_features(x[:, 0], x[:, 1], 1.0)
-    assert feats.shape == (1, 16, PUNCH_FEATURE_DIM)
-    assert torch.isfinite(feats).all()
-
-
-def test_classifier_forward_shape():
-    model = PunchPairClassifier(num_classes=8, hidden=32, layers=1)
-    x = torch.from_numpy(np.stack([normalize_window(_window(seed=s)) for s in range(4)]))  # (4, 2, T, 17, 3)
-    out = model(x)
-    assert out.shape == (4, 8)
-    assert torch.isfinite(out).all()
-
-
 def test_focal_gamma_zero_matches_weighted_cross_entropy():
-    from boxing.train_punch_classifier import FocalCrossEntropy
+    from boxing.losses import FocalCrossEntropy
 
     torch.manual_seed(0)
     logits = torch.randn(32, 8)
@@ -66,7 +49,7 @@ def test_focal_gamma_zero_matches_weighted_cross_entropy():
 
 
 def test_focal_downweights_easy_examples():
-    from boxing.train_punch_classifier import FocalCrossEntropy
+    from boxing.losses import FocalCrossEntropy
 
     logits = torch.tensor([[8.0, 0.0], [0.5, 0.0]])  # first is easy, second is hard
     target = torch.tensor([0, 0])

@@ -15,7 +15,6 @@ from boxing.epam_dataset import (
     keypoints_in_crop,
     mirror,
 )
-from boxing.model import EPAMNet
 from boxing.pair_dataset import FLIP_PERM
 
 W, H, T = 128, 96, 16
@@ -120,7 +119,7 @@ def test_training_smoke_test_runs_every_stage(data, tmp_path, monkeypatch):
     small = dict(
         rgb_blocks=(1, 1, 1, 1), rgb_channels=(8, 16, 24, 32), pose_blocks=(1, 1, 1), pose_channels=(8, 16, 24)
     )
-    monkeypatch.setattr(train, "EPAMNet", lambda num_classes: EPAMNet(num_classes=num_classes, **small))
+    monkeypatch.setattr(train, "MODEL_OVERRIDES", small)
     out = tmp_path / "run"
     monkeypatch.setattr(
         sys, "argv",
@@ -129,7 +128,7 @@ def test_training_smoke_test_runs_every_stage(data, tmp_path, monkeypatch):
     train.main()
     metrics = json.loads((out / "metrics.json").read_text())
     assert metrics["test_mode"] is True and len(metrics["history"]) == train.TEST_EPOCHS
-    assert (out / "best.pt").exists()
+    assert (out / "best" / "model.safetensors").exists() and (out / "best" / "README.md").exists()
     assert {"loss", "lr", "val_macro_f1", "val_macro_f1_rgb", "val_macro_f1_pose"} <= set(metrics["history"][0])
 
 

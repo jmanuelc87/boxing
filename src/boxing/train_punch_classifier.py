@@ -11,9 +11,15 @@ Train and validation are separate fights, so the score reflects unseen fights. T
 the best validation macro F1 of the fused prediction is kept, since accuracy alone is dominated by
 the common "Jab a la cabeza" class.
 
+The best model is saved with ``save_pretrained`` (``best/``: ``model.safetensors``, ``config.json``,
+the model code and a model card) and, unless ``--no-push``, uploaded to the Hugging Face Hub repo
+``--hub-repo`` each time the validation score improves. A resumable checkpoint (weights, optimiser,
+scheduler, history) is uploaded to ``checkpoints/last`` after every epoch. Both need ``HF_TOKEN``
+(read from ``.env``). A repo that does not exist yet is created private unless ``--hub-public``.
+
 ``--test`` runs every stage of the real pipeline on a handful of windows: data loading with
 augmentation, forward and backward passes, the scheduler, validation, the checkpoint, reloading it,
-and the metrics file. It uses 2 short epochs, a different output folder, and the numbers it prints
+and the metrics file. It never pushes or logs to wandb. It uses 2 short epochs, a different output folder, and the numbers it prints
 mean nothing. Use it to check a change in seconds before starting a long run.
 
 The model is large for a laptop. Measured here, a step of 4 clips took 1.6 s on the CPU and 3.4 s on
@@ -32,12 +38,15 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
+from dotenv import load_dotenv
+from huggingface_hub import HfApi, ModelCard, ModelCardData
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from boxing.epam_dataset import EPAMDataset
 from boxing.losses import FocalCrossEntropy
-from boxing.model import EPAMNet
+from boxing.model import EPAMNet, EPAMNetConfig
 from boxing.pair_dataset import load_names
 
 TEST_EPOCHS = 2
@@ -45,6 +54,8 @@ TEST_BATCH = 4
 TEST_TRAIN_WINDOWS = 24
 TEST_VAL_WINDOWS = 16
 TEST_WORKERS = 2
+HUB_REPO = "jmanuelc87/boxing-punch-epam-net"
+MODEL_OVERRIDES: dict = {}  # extra EPAMNetConfig fields; the tests shrink the network with this
 
 
 def pick_device(name: str | None) -> torch.device:
@@ -113,7 +124,98 @@ def lr_factor(step: int, total_steps: int, warmup_steps: int, floor: float = 0.0
     return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int) -> float:
+def model_card(names: list[str], args: argparse.Namespace, best_epoch: int, result: dict, n_params: int) -> str:
+    """README.md for the Hub repo: what the model is, how to load it, and the validation scores."""
+    fused = result["fused"]
+    rows = "\n".join(
+        f"| {n} | {fused['precision'][i]:.3f} | {fused['recall'][i]:.3f} | {fused['f1'][i]:.3f} | {int(fused['support'][i])} |"
+        for i, n in enumerate(names)
+    )
+    front = ModelCardData(
+        library_name="transformers",
+        pipeline_tag="video-classification",
+        tags=["boxing", "action-recognition", "pose", "two-stream", "epam-net"],
+        metrics=["accuracy", "f1"],
+    ).to_yaml()
+    return f"""---
+{front}
+---
+
+# Boxing punch classifier (EPAM-Net)
+
+Classifies a 16-frame window of a boxing round into one of {len(names)} punch classes. It is a
+reimplementation in plain PyTorch of EPAM-Net (Nady et al., Neurocomputing 2025,
+[arXiv:2408.05421](https://arxiv.org/abs/2408.05421)): an RGB stream and a pose stream, with the pose
+features guiding the RGB stream's attention. The two streams' softmax scores are fused at inference.
+{n_params / 1e6:.2f}M parameters.
+
+## Input
+
+* `images`: `(B, 16, 3, 224, 224)`, one square crop around both boxers, ImageNet-normalised RGB.
+* `keypoints`: `(B, 2, 16, 17, 3)`, COCO joints `(x, y, score)` of the attacker and the opponent, with
+  `x` and `y` in `[0, 1]` of the same crop.
+
+## Usage
+
+```python
+import torch
+from transformers import AutoModel
+
+model = AutoModel.from_pretrained("{args.hub_repo}", trust_remote_code=True).eval()
+with torch.no_grad():
+    out = model(images, keypoints)
+probs = out.probabilities(model.config.rgb_weight)   # fused scores, (B, {len(names)})
+label = model.config.id2label[probs.argmax(-1)[0].item()]
+```
+
+The model code is in `model.py` in this repo, so `trust_remote_code=True` runs that file. Read it
+first if you do not trust the source.
+
+## Validation results
+
+The best epoch ({best_epoch}) by fused macro F1 on the validation split. Train and validation are
+separate fights, so these scores are on fights the model did not see. Accuracy alone is dominated by
+the most common class, so the macro F1 is the number to watch.
+
+| | accuracy | macro F1 |
+|---|---|---|
+| fused (RGB + pose) | {fused['accuracy']:.3f} | {fused['macro_f1']:.3f} |
+| RGB stream alone | {result['rgb']['accuracy']:.3f} | {result['rgb']['macro_f1']:.3f} |
+| pose stream alone | {result['pose']['accuracy']:.3f} | {result['pose']['macro_f1']:.3f} |
+
+| class | precision | recall | F1 | support |
+|---|---|---|---|---|
+{rows}
+
+## Training
+
+SGD (momentum {args.momentum}, weight decay {args.weight_decay}), learning rate {args.lr} with a
+{args.warmup_epochs:g}-epoch warm-up then cosine decay, batch size {args.batch_size},
+{args.loss} loss (label smoothing {args.label_smoothing}), inverse-square-root class weights,
+seed {args.seed}. Windows quality filter: `{args.quality}`.
+
+## Limitations
+
+Trained on a small set of annotated fights, so it may not transfer to other cameras, rings or
+styles. The pose input comes from a separate keypoint detector, and its errors carry through. The
+validation split was used to pick the checkpoint, so the scores above are slightly optimistic.
+"""
+
+
+def push_folder(api: HfApi | None, repo: str, folder: Path, path_in_repo: str, message: str) -> None:
+    """Upload a folder to the Hub. A network failure is reported, not fatal: training goes on."""
+    if api is None:
+        return
+    try:
+        api.upload_folder(repo_id=repo, folder_path=str(folder), path_in_repo=path_in_repo, commit_message=message)
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: upload of {folder} to {repo}:{path_in_repo} failed ({exc})")
+
+
+def train_epoch(
+    model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int, log_every: int = 0
+) -> float:
+    """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many steps."""
     model.train()
     total, seen = 0.0, 0
     bar = tqdm(loader, desc=f"epoch {epoch}/{epochs}", leave=False)
@@ -129,6 +231,11 @@ def train_epoch(model, loader, criterion, optimizer, scheduler, device, epoch: i
         total += loss.item() * len(y)
         seen += len(y)
         bar.set_postfix(loss=f"{total / seen:.3f}")
+        if log_every and wandb.run is not None and scheduler.last_epoch % log_every == 0:
+            wandb.log(
+                {"step/loss": loss.item(), "step/lr": optimizer.param_groups[0]["lr"], "epoch": epoch},
+                step=scheduler.last_epoch,
+            )
     return total / seen
 
 
@@ -153,12 +260,21 @@ def main() -> None:
     parser.add_argument("--device", default=None, help="cuda or cpu (default: cuda if available, else cpu)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--test", action="store_true", help="smoke test: the whole pipeline on a few windows")
+    parser.add_argument("--wandb-project", default="boxing", help="Weights & Biases project (needs WANDB_API_KEY)")
+    parser.add_argument("--wandb-name", default=None, help="run name (default: wandb picks one)")
+    parser.add_argument("--log-every", type=int, default=100, help="push loss and LR to wandb every N steps")
+    parser.add_argument("--no-wandb", action="store_true", help="do not log to Weights & Biases")
+    parser.add_argument("--hub-repo", default=HUB_REPO, help="Hugging Face repo that receives the best model and checkpoints")
+    parser.add_argument("--hub-public", action="store_true", help="create the repo public if it does not exist (default: private)")
+    parser.add_argument("--no-push", action="store_true", help="do not upload to the Hugging Face Hub")
     args = parser.parse_args()
+    load_dotenv()  # HF_TOKEN and WANDB_API_KEY from .env
 
     if args.test:
         args.epochs, args.batch_size = TEST_EPOCHS, TEST_BATCH
         args.workers = min(args.workers, TEST_WORKERS)
         args.patience = args.epochs
+        args.no_wandb = args.no_push = True  # smoke-test numbers are meaningless; keep them out of wandb and the Hub
     out_dir = args.out or Path("runs/epam-test" if args.test else "runs/epam-net")
 
     random.seed(args.seed)
@@ -188,8 +304,16 @@ def main() -> None:
     else:
         criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=args.label_smoothing)
 
-    model = EPAMNet(num_classes=n_classes).to(device)
-    print(f"parameters {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    config = EPAMNetConfig(
+        num_classes=n_classes,
+        rgb_weight=args.rgb_weight,
+        id2label=dict(enumerate(names)),
+        label2id={n: i for i, n in enumerate(names)},
+        **MODEL_OVERRIDES,
+    )
+    model = EPAMNet(config).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"parameters {n_params / 1e6:.2f}M")
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
@@ -197,10 +321,26 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: lr_factor(s, total_steps, warmup_steps))
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    best_dir, ckpt_dir = out_dir / "best", out_dir / "checkpoint"
+    api = None
+    if not args.no_push:
+        api = HfApi()
+        api.create_repo(args.hub_repo, private=not args.hub_public, exist_ok=True)
+        print(f"pushing to https://huggingface.co/{args.hub_repo}")
+    run = None
+    if not args.no_wandb:
+        run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+            job_type="train",
+        )
     best_f1, best_epoch, history = -1.0, 0, []
     for epoch in range(1, args.epochs + 1):
         started = time.time()
-        loss = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs)
+        loss = train_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every
+        )
         val = evaluate(model, val_loader, device, n_classes, args.rgb_weight)
         f1 = val["fused"]["macro_f1"]
         row = {
@@ -214,26 +354,49 @@ def main() -> None:
             "seconds": time.time() - started,
         }
         history.append(row)
+        if run is not None:
+            wandb.log(
+                {
+                    "epoch/train_loss": loss,
+                    "epoch/lr": row["lr"],
+                    "epoch/val_acc": row["val_acc"],
+                    "epoch/val_macro_f1": f1,
+                    "epoch/val_macro_f1_rgb": row["val_macro_f1_rgb"],
+                    "epoch/val_macro_f1_pose": row["val_macro_f1_pose"],
+                    "epoch/seconds": row["seconds"],
+                    "epoch": epoch,
+                },
+                step=scheduler.last_epoch,
+            )
         marker = ""
         if f1 > best_f1:
             best_f1, best_epoch, marker = f1, epoch, " *"
-            torch.save(
-                {"state_dict": model.state_dict(), "config": {"num_classes": n_classes, "rgb_weight": args.rgb_weight}, "names": names},
-                out_dir / "best.pt",
-            )
+            model.save_pretrained(best_dir)
+            push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val macro F1 {f1:.3f}")
         print(
             f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  macro F1 {f1:.3f} "
             f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  {row['seconds']:.0f}s{marker}"
         )
+        model.save_pretrained(ckpt_dir)
+        torch.save(
+            {
+                "epoch": epoch,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_f1": best_f1,
+                "best_epoch": best_epoch,
+                "history": history,
+            },
+            ckpt_dir / "training_state.pt",
+        )
+        push_folder(api, args.hub_repo, ckpt_dir, "checkpoints/last", f"Checkpoint: epoch {epoch}")
         if epoch - best_epoch >= args.patience:
             print(f"no macro-F1 gain for {args.patience} epochs, stopping")
             break
 
     # Report the best checkpoint, reloaded from disk into a fresh model, not the last epoch.
-    best = torch.load(out_dir / "best.pt", map_location=device)
-    reloaded = EPAMNet(num_classes=best["config"]["num_classes"]).to(device)
-    reloaded.load_state_dict(best["state_dict"])
-    final = evaluate(reloaded, val_loader, device, n_classes, best["config"]["rgb_weight"])
+    reloaded = EPAMNet.from_pretrained(best_dir).to(device)
+    final = evaluate(reloaded, val_loader, device, n_classes, reloaded.config.rgb_weight)
     if args.test and not math.isclose(final["fused"]["macro_f1"], best_f1, abs_tol=1e-6):
         raise RuntimeError(f"reloaded checkpoint scores {final['fused']['macro_f1']:.4f}, expected {best_f1:.4f}")
     print(f"\nbest epoch {best_epoch}" + ("  (checkpoint reload verified)" if args.test else ""))
@@ -262,7 +425,31 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
-    print(f"saved {out_dir / 'best.pt'} and {out_dir / 'metrics.json'}")
+    if run is not None:
+        run.summary.update(
+            {
+                "best_epoch": best_epoch,
+                "final/accuracy": final["fused"]["accuracy"],
+                "final/macro_f1": final["fused"]["macro_f1"],
+                "final/macro_f1_rgb": final["rgb"]["macro_f1"],
+                "final/macro_f1_pose": final["pose"]["macro_f1"],
+            }
+        )
+        run.finish()
+    # The model card is written last, from the reloaded checkpoint's final scores, then pushed with the metrics.
+    (best_dir / "README.md").write_text(model_card(names, args, best_epoch, final, n_params), encoding="utf-8")
+    print(f"wrote model card {best_dir / 'README.md'}")
+    if api is not None:
+        push_folder(api, args.hub_repo, best_dir, ".", f"Model card and final scores: best epoch {best_epoch}")
+        try:
+            api.upload_file(
+                repo_id=args.hub_repo, path_or_fileobj=str(out_dir / "metrics.json"), path_in_repo="metrics.json",
+                commit_message="Final metrics",
+            )
+            print(f"pushed https://huggingface.co/{args.hub_repo}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: upload of metrics.json failed ({exc})")
+    print(f"saved {best_dir} and {out_dir / 'metrics.json'}")
 
 
 if __name__ == "__main__":

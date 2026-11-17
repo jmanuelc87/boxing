@@ -26,7 +26,7 @@ flowchart TB
     kp -->|"boxing.pairing"| pairs
     pairs -->|"pair_dataset.normalize_window"| norm
     clips -->|"epam_dataset: crop, resize"| crops
-    kp -->|"epam_dataset: same crop"| heat
+    norm -->|"epam_dataset: same crop"| heat
     crops --> model
     heat --> model
     model --> out

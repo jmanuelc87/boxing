@@ -3,6 +3,7 @@ import torch
 
 from boxing.model import (
     EPAMNet,
+    EPAMNetConfig,
     EPAMOutput,
     PoseGuidedAttention,
     TemporalShift,
@@ -67,13 +68,13 @@ def test_attention_is_a_bounded_spatial_temporal_map():
 
 
 def test_default_sizes_match_the_reference_widths():
-    model = EPAMNet()
+    model = EPAMNet(EPAMNetConfig())
     assert model.rgb_backbone.out_channels == 432
     assert model.pose_backbone.out_channels == 216
 
 
 def test_forward_shapes_and_late_fusion():
-    model = EPAMNet(**SMALL).eval()
+    model = EPAMNet(EPAMNetConfig(**SMALL)).eval()
     images = torch.randn(2, 4, 3, 224, 224)
     with torch.no_grad():
         out = model(images, _keypoints())
@@ -86,7 +87,7 @@ def test_forward_shapes_and_late_fusion():
 
 
 def test_rgb_loss_reaches_the_pose_stream_through_the_attention():
-    model = EPAMNet(**SMALL).train()
+    model = EPAMNet(EPAMNetConfig(**SMALL)).train()
     out = model(torch.randn(2, 4, 3, 224, 224), _keypoints())
     out.rgb_logits.sum().backward()
     assert all(p.grad is not None for p in model.pose_backbone.parameters())
@@ -95,7 +96,7 @@ def test_rgb_loss_reaches_the_pose_stream_through_the_attention():
 
 
 def test_pose_frames_are_strided_to_match_rgb_frames():
-    model = EPAMNet(**SMALL).eval()
+    model = EPAMNet(EPAMNetConfig(**SMALL)).eval()
     with torch.no_grad():
         out = model(torch.randn(1, 4, 3, 224, 224), _keypoints(batch=1, frames=8))
     assert out.rgb_logits.shape == (1, 8)
@@ -104,7 +105,19 @@ def test_pose_frames_are_strided_to_match_rgb_frames():
 
 
 def test_mismatched_spatial_sizes_are_pooled_to_the_rgb_map():
-    model = EPAMNet(**SMALL).eval()
+    model = EPAMNet(EPAMNetConfig(**SMALL)).eval()
     with torch.no_grad():
         out = model(torch.randn(1, 4, 3, 112, 112), _keypoints(batch=1))  # RGB map 4x4, pose map 7x7
     assert out.rgb_logits.shape == (1, 8)
+
+
+def test_save_and_reload_roundtrip(tmp_path):
+    config = EPAMNetConfig(**SMALL, id2label={i: f"c{i}" for i in range(8)}, rgb_weight=0.7)
+    model = EPAMNet(config).eval()
+    model.save_pretrained(tmp_path)
+    reloaded = EPAMNet.from_pretrained(tmp_path).eval()
+    assert reloaded.config.rgb_blocks == (1, 1, 1, 1) and reloaded.config.rgb_weight == 0.7
+    assert reloaded.config.id2label[3] == "c3"
+    images, kp = torch.randn(1, 4, 3, 224, 224), _keypoints(batch=1)
+    with torch.no_grad():
+        torch.testing.assert_close(model(images, kp).rgb_logits, reloaded(images, kp).rgb_logits)

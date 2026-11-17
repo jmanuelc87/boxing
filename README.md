@@ -313,11 +313,21 @@ Each epoch prints the training loss, the validation accuracy and macro F1 of the
 
 ```
 runs/epam-net/
-├── best.pt         # weights, class names and the fusion weight
+├── best/           # save_pretrained folder: model.safetensors, config.json (class names, fusion weight), model.py, README.md (model card)
+├── checkpoint/     # last epoch: weights plus training_state.pt (optimiser, scheduler, history)
 └── metrics.json    # per-epoch history, per-class precision/recall/F1, confusion matrix, arguments
 ```
 
-The end of the run reloads `best.pt` into a fresh model and prints the fused confusion matrix, along with the RGB-only and pose-only macro F1.
+### Hugging Face Hub
+
+Unless `--no-push` is given, `best/` is uploaded to the repo `--hub-repo` (default `jmanuelc87/boxing-punch-epam-net`) each time the validation macro F1 improves, and `checkpoint/` goes to `checkpoints/last` after every epoch. Put `HF_TOKEN` in `.env`. A repo that does not exist is created private; add `--hub-public` to make it public. `--test` never pushes. Load the result with:
+
+```python
+from transformers import AutoModel
+model = AutoModel.from_pretrained("jmanuelc87/boxing-punch-epam-net", trust_remote_code=True)
+```
+
+The end of the run reloads `best/` into a fresh model and prints the fused confusion matrix, along with the RGB-only and pose-only macro F1.
 
 ### Timing
 

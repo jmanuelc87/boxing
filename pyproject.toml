@@ -14,7 +14,7 @@ dependencies = [
     "tensorboard>=2.21.0",
     "timm>=1.0.31",
     "torch>=2.13,<2.15",
-    "torchreid",
+    "torchreid @ git+https://github.com/KaiyangZhou/deep-person-reid.git@f8cd150fdf77e8d9e1ed143b7f308c2c609ded50",
     "torchvision>=0.28,<0.30",
     "tqdm>=4.70.1",
     "transformers>=5.23.0",
@@ -30,11 +30,13 @@ boxing = "boxing.main:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/boxing"]
 
 [tool.uv.sources]
-torchreid = { git = "https://github.com/KaiyangZhou/deep-person-reid.git", rev = "f8cd150fdf77e8d9e1ed143b7f308c2c609ded50" }
 
 [dependency-groups]
 dev = [

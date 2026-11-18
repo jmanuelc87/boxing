@@ -211,20 +211,15 @@ def push_folder(api: HfApi | None, repo: str, folder: Path, path_in_repo: str, m
         print(f"warning: upload of {folder} to {repo}:{path_in_repo} failed ({exc})")
 
 
-GRAD_CLIP = 5.0
-
-
 def train_epoch(
     model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int, log_every: int = 0
-) -> tuple[float, dict[str, float]]:
+) -> float:
     """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many steps.
 
-    Returns the mean loss and the gradient-norm statistics: the norm before clipping at ``GRAD_CLIP``,
-    its mean and max over the epoch, and the share of steps that were clipped.
+    Returns the mean loss over the epoch.
     """
     model.train()
     total, seen = 0.0, 0
-    norms = []
     bar = tqdm(loader, desc=f"epoch {epoch}/{epochs}", leave=False)
     for images, keypoints, y in bar:
         images, keypoints, y = images.to(device), keypoints.to(device), y.to(device)
@@ -232,7 +227,6 @@ def train_epoch(
         loss = criterion(out.rgb_logits, y) + criterion(out.pose_logits, y)
         optimizer.zero_grad()
         loss.backward()
-        norms.append(float(nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)))  # returns the norm before clipping
         optimizer.step()
         scheduler.step()
         total += loss.item() * len(y)
@@ -243,12 +237,7 @@ def train_epoch(
                 {"step/loss": loss.item(), "step/lr": optimizer.param_groups[0]["lr"], "epoch": epoch},
                 step=scheduler.last_epoch,
             )
-    grad = {
-        "grad_norm_mean": float(np.mean(norms)) if norms else 0.0,
-        "grad_norm_max": float(np.max(norms)) if norms else 0.0,
-        "clipped_share": float(np.mean(np.asarray(norms) > GRAD_CLIP)) if norms else 0.0,
-    }
-    return total / seen, grad
+    return total / seen
 
 
 def main() -> None:
@@ -366,7 +355,7 @@ def main() -> None:
     best_f1, best_epoch, history = -1.0, 0, []
     for epoch in range(1, args.epochs + 1):
         started = time.time()
-        loss, grad = train_epoch(
+        loss = train_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every
         )
         val = evaluate(model, val_loader, device, n_classes, args.rgb_weight)
@@ -380,7 +369,6 @@ def main() -> None:
             "val_macro_f1_rgb": val["rgb"]["macro_f1"],
             "val_macro_f1_pose": val["pose"]["macro_f1"],
             "seconds": time.time() - started,
-            **grad,
         }
         history.append(row)
         if run is not None:
@@ -393,9 +381,6 @@ def main() -> None:
                     "epoch/val_macro_f1_rgb": row["val_macro_f1_rgb"],
                     "epoch/val_macro_f1_pose": row["val_macro_f1_pose"],
                     "epoch/seconds": row["seconds"],
-                    "epoch/grad_norm_mean": grad["grad_norm_mean"],
-                    "epoch/grad_norm_max": grad["grad_norm_max"],
-                    "epoch/clipped_share": grad["clipped_share"],
                     "epoch": epoch,
                 },
                 step=scheduler.last_epoch,
@@ -408,7 +393,6 @@ def main() -> None:
         print(
             f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  macro F1 {f1:.3f} "
             f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  "
-            f"grad {grad['grad_norm_mean']:.2f} max {grad['grad_norm_max']:.2f} clipped {grad['clipped_share']:.0%}  "
             f"{row['seconds']:.0f}s{marker}"
         )
         model.save_pretrained(ckpt_dir)

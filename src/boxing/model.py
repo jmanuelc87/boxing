@@ -91,9 +91,11 @@ def keypoints_to_heatmaps(
 
 
 class TemporalShift(nn.Module):
-    """Shift a fraction of the channels one frame forward and one backward in time (TSM).
+    """Shift a fraction of the channels one frame back and one forward in time (TSM).
 
-    Costs no parameters or FLOPs. Frames shifted past either end are zero-filled.
+    The first ``C // fold_div`` channels take the next frame (``out[t] = x[t + 1]``), the next
+    ``C // fold_div`` the previous one, as in the official EPAM-Net code, so its pretrained weights
+    line up. Costs no parameters or FLOPs. Frames shifted past either end are zero-filled.
     """
 
     def __init__(self, fold_div: int = 8):
@@ -104,15 +106,24 @@ class TemporalShift(nn.Module):
         fold = x.shape[1] // self.fold_div
         if fold == 0 or x.shape[2] < 2:
             return x
-        forward_shift = F.pad(x[:, :fold, :-1], (0, 0, 0, 0, 1, 0))
-        backward_shift = F.pad(x[:, fold : 2 * fold, 1:], (0, 0, 0, 0, 0, 1))
-        return torch.cat([forward_shift, backward_shift, x[:, 2 * fold :]], dim=1)
+        from_next = F.pad(x[:, :fold, 1:], (0, 0, 0, 0, 0, 1))
+        from_previous = F.pad(x[:, fold : 2 * fold, :-1], (0, 0, 0, 0, 1, 0))
+        return torch.cat([from_next, from_previous, x[:, 2 * fold :]], dim=1)
+
+
+def _round_width(width: float, multiplier: float = 1 / 16, min_width: int = 8, divisor: int = 8) -> int:
+    """Hidden width of a squeeze-and-excite block, rounded the way the official X3D code does."""
+    width *= multiplier
+    rounded = max(min_width, int(width + divisor / 2) // divisor * divisor)
+    if rounded < 0.9 * width:
+        rounded += divisor
+    return int(rounded)
 
 
 class SqueezeExcite3d(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, channels: int):
         super().__init__()
-        hidden = max(8, channels // reduction)
+        hidden = _round_width(channels)
         self.fc1 = nn.Conv3d(channels, hidden, 1)
         self.fc2 = nn.Conv3d(hidden, channels, 1)
 
@@ -174,6 +185,7 @@ class XShiftNet(nn.Module):
         stage_channels: tuple[int, ...],
         stem_stride: int,
         expand: float = 2.25,
+        shift_div: int = 8,
     ):
         super().__init__()
         if len(stage_blocks) != len(stage_channels):
@@ -187,8 +199,12 @@ class XShiftNet(nn.Module):
         for blocks, out_ch in zip(stage_blocks, stage_channels):
             layers = []
             for i in range(blocks):
-                # X3D puts squeeze-and-excitation on every other block ("half" style).
-                layers.append(ShiftBlock(in_ch, out_ch, stride=2 if i == 0 else 1, expand=expand, use_se=(i + 1) % 2 == 0))
+                # X3D puts squeeze-and-excitation on every other block, starting with the first ("half" style).
+                layers.append(
+                    ShiftBlock(
+                        in_ch, out_ch, stride=2 if i == 0 else 1, expand=expand, use_se=i % 2 == 0, shift_div=shift_div
+                    )
+                )
                 in_ch = out_ch
             stages.append(nn.Sequential(*layers))
         self.stages = nn.Sequential(*stages)
@@ -258,6 +274,8 @@ class EPAMNetConfig(PreTrainedConfig):
             11, 7) for RGB and its last three stages (5, 11, 7) for pose.
         rgb_channels / pose_channels: output width of each stage.
         dropout: dropout before each classifier.
+        rgb_shift_div / pose_shift_div: a ``1/div`` share of the channels is shifted each way in
+            time in every block (the official code uses 8 for RGB and 4 for pose).
         rgb_weight: weight of the RGB stream when fusing the two streams' scores at inference.
     """
 
@@ -275,6 +293,8 @@ class EPAMNetConfig(PreTrainedConfig):
         pose_channels: tuple[int, ...] = (24, 48, 96),
         dropout: float = 0.5,
         rgb_weight: float = 0.5,
+        rgb_shift_div: int = 8,
+        pose_shift_div: int = 4,
         **kwargs,
     ):
         self.num_classes = num_classes
@@ -287,6 +307,7 @@ class EPAMNetConfig(PreTrainedConfig):
         self.rgb_channels, self.pose_channels = tuple(rgb_channels), tuple(pose_channels)
         self.dropout = dropout
         self.rgb_weight = rgb_weight
+        self.rgb_shift_div, self.pose_shift_div = rgb_shift_div, pose_shift_div
         super().__init__(**kwargs)
 
 
@@ -300,8 +321,10 @@ class EPAMNet(PreTrainedModel):
     def __init__(self, config: EPAMNetConfig):
         super().__init__(config)
         self.heatmap_size, self.sigma, self.min_score = config.heatmap_size, config.sigma, config.min_score
-        self.rgb_backbone = XShiftNet(3, config.rgb_blocks, config.rgb_channels, stem_stride=2)
-        self.pose_backbone = XShiftNet(NUM_PLAYERS * NUM_JOINTS, config.pose_blocks, config.pose_channels, stem_stride=1)
+        self.rgb_backbone = XShiftNet(3, config.rgb_blocks, config.rgb_channels, stem_stride=2, shift_div=config.rgb_shift_div)
+        self.pose_backbone = XShiftNet(
+            NUM_PLAYERS * NUM_JOINTS, config.pose_blocks, config.pose_channels, stem_stride=1, shift_div=config.pose_shift_div
+        )
         self.attention = PoseGuidedAttention()
         self.rgb_head = ClassifierHead(self.rgb_backbone.out_channels, config.num_classes, config.dropout)
         self.pose_head = ClassifierHead(self.pose_backbone.out_channels, config.num_classes, config.dropout)

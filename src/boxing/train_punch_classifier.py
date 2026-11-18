@@ -48,6 +48,7 @@ from boxing.epam_dataset import EPAMDataset
 from boxing.losses import FocalCrossEntropy
 from boxing.model import EPAMNet, EPAMNetConfig
 from boxing.pair_dataset import load_names
+from boxing.pretrained import load_official_backbone
 
 TEST_EPOCHS = 2
 TEST_BATCH = 4
@@ -252,6 +253,8 @@ def main() -> None:
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce", help="ce: weighted cross entropy; focal: FocalCrossEntropy")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--rgb-weight", type=float, default=0.5, help="weight of the RGB stream when fusing scores")
+    parser.add_argument("--init-rgb", type=Path, default=None, help="official EPAM-Net RGB checkpoint (.pth) for the RGB backbone")
+    parser.add_argument("--init-pose", type=Path, default=None, help="official EPAM-Net pose checkpoint (.pth) for the pose backbone")
     parser.add_argument(
         "--sigma", type=parse_sigma, default=0.6,
         help="Gaussian radius of the pose heatmaps: one value for all joints, or 17 comma-separated values, one per COCO joint",
@@ -315,6 +318,12 @@ def main() -> None:
         **MODEL_OVERRIDES,
     )
     model = EPAMNet(config).to(device)
+    if args.init_rgb:
+        load_official_backbone(model.rgb_backbone, args.init_rgb)
+        print(f"RGB backbone initialised from {args.init_rgb.name}")
+    if args.init_pose:
+        load_official_backbone(model.pose_backbone, args.init_pose, players=2)  # stem copied for both boxers
+        print(f"pose backbone initialised from {args.init_pose.name}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"parameters {n_params / 1e6:.2f}M")
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)

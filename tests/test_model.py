@@ -52,10 +52,11 @@ def test_temporal_shift_moves_channel_groups_in_time_and_zero_pads():
     x = torch.arange(1 * 16 * 5 * 2 * 2, dtype=torch.float32).reshape(1, 16, 5, 2, 2)
     y = TemporalShift(fold_div=8)(x)  # fold = 2 channels per direction
     assert y.shape == x.shape
-    assert not y[:, :2, 0].any()
-    torch.testing.assert_close(y[:, :2, 1:], x[:, :2, :-1])
-    assert not y[:, 2:4, -1].any()
-    torch.testing.assert_close(y[:, 2:4, :-1], x[:, 2:4, 1:])
+    # Same direction as the official EPAM-Net code: first group takes the next frame, second the previous.
+    assert not y[:, :2, -1].any()
+    torch.testing.assert_close(y[:, :2, :-1], x[:, :2, 1:])
+    assert not y[:, 2:4, 0].any()
+    torch.testing.assert_close(y[:, 2:4, 1:], x[:, 2:4, :-1])
     torch.testing.assert_close(y[:, 4:], x[:, 4:])
     assert sum(p.numel() for p in TemporalShift().parameters()) == 0
 
@@ -121,3 +122,18 @@ def test_save_and_reload_roundtrip(tmp_path):
     images, kp = torch.randn(1, 4, 3, 224, 224), _keypoints(batch=1)
     with torch.no_grad():
         torch.testing.assert_close(model(images, kp).rgb_logits, reloaded(images, kp).rgb_logits)
+
+
+def test_squeeze_excite_width_follows_the_official_rounding():
+    from boxing.model import SqueezeExcite3d
+
+    assert [SqueezeExcite3d(c).fc1.out_channels for c in (54, 108, 216)] == [8, 8, 16]
+
+
+def test_se_sits_on_even_blocks_and_pose_shifts_a_quarter():
+    from boxing.model import EPAMNet, EPAMNetConfig, SqueezeExcite3d
+
+    model = EPAMNet(EPAMNetConfig(num_classes=3))
+    stage = model.rgb_backbone.stages[0]
+    assert [isinstance(b.se, SqueezeExcite3d) for b in stage] == [True, False, True]
+    assert (model.rgb_backbone.stages[0][0].shift.fold_div, model.pose_backbone.stages[0][0].shift.fold_div) == (8, 4)

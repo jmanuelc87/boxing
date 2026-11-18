@@ -40,6 +40,7 @@ import torch.nn as nn
 import wandb
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, ModelCard, ModelCardData
+from huggingface_hub.utils import disable_progress_bars
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -274,6 +275,7 @@ def main() -> None:
     parser.add_argument("--no-push", action="store_true", help="do not upload to the Hugging Face Hub")
     args = parser.parse_args()
     load_dotenv()  # HF_TOKEN and WANDB_API_KEY from .env
+    disable_progress_bars()  # the Hub's upload bars flood the console; our own epoch lines are enough
 
     if args.test:
         args.epochs, args.batch_size = TEST_EPOCHS, TEST_BATCH

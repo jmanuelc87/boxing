@@ -63,6 +63,8 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from tqdm import tqdm
 
 log = logging.getLogger("boxing.pairing")
+# DeepSORT logs a block of "initialised" lines for every tracker, i.e. every clip.
+logging.getLogger("deep_sort_realtime").setLevel(logging.WARNING)
 
 NUM_KEYPOINTS = 17
 N_BOXERS = 2
@@ -362,6 +364,11 @@ def main() -> None:
         parser.error(f"--src is not a directory: {args.src}")
     if not args.keypoints.is_dir():
         parser.error(f"--keypoints is not a directory: {args.keypoints}")
+
+    # The per-frame JSONs live under <keypoints>/images/<task>/. Accept the parent directory too.
+    if (args.keypoints / "images").is_dir():
+        log.info("using %s as the keypoint root (the JSONs are under images/)", args.keypoints / "images")
+        args.keypoints = args.keypoints / "images"
 
     cfg = TrackConfig(
         cpu=args.cpu,

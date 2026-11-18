@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import logging
+import pickle
 import random
 from pathlib import Path
 
@@ -29,6 +31,8 @@ import torch.nn as nn
 from PIL import Image
 
 from boxing.person_crops import padded_box
+
+log = logging.getLogger("boxing.train_role_classifier")
 
 ROLES = ["boxer_red", "boxer_blue", "referee", "other"]
 
@@ -302,6 +306,24 @@ def report(name: str, truth: list[str], pred: list[str]) -> dict:
     return m
 
 
+def load_checkpoint(path: Path) -> dict:
+    """Load a checkpoint saved by ``main``, on any PyTorch version.
+
+    PyTorch 2.6 made ``torch.load`` refuse anything but tensors and plain containers
+    (``weights_only=True``). Checkpoints that hold other objects, such as numpy scalars or paths
+    from an older version of this script, need the old full unpickling. That can run code from
+    the file, so it is only a fallback for checkpoints you trained yourself; PyTorch before 1.13
+    has no ``weights_only`` argument and always loads the old way.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # PyTorch < 1.13: no weights_only argument
+        return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError:
+        log.warning("%s needs full unpickling (weights_only=False); only load checkpoints you trust", path)
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+
 class RoleClassifier:
     """The fine-tuned role model saved by ``main`` (``role_model.pt``), used to classify live people.
 
@@ -309,7 +331,7 @@ class RoleClassifier:
     """
 
     def __init__(self, path: Path, device: torch.device | None = None, pad: float = 0.1):
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = load_checkpoint(path)
         if ckpt["roles"] != ROLES:
             raise ValueError(f"{path} was trained for roles {ckpt['roles']}, expected {ROLES}")
         self.device = device or torch.device("mps" if torch.backends.mps.is_available() else "cpu")

@@ -324,6 +324,15 @@ def load_checkpoint(path: Path) -> dict:
         return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def _best_device() -> torch.device:
+    """CUDA if available, then Apple MPS, then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 class RoleClassifier:
     """The fine-tuned role model saved by ``main`` (``role_model.pt``), used to classify live people.
 
@@ -334,7 +343,7 @@ class RoleClassifier:
         ckpt = load_checkpoint(path)
         if ckpt["roles"] != ROLES:
             raise ValueError(f"{path} was trained for roles {ckpt['roles']}, expected {ROLES}")
-        self.device = device or torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = device or _best_device()
         self.model = FineTuner(ckpt["backbone"])
         self.model.load_state_dict(ckpt["model"])
         self.model.eval().to(self.device)

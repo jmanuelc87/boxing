@@ -64,6 +64,12 @@ def pick_device(name: str | None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def parse_sigma(text: str) -> float | list[float]:
+    """``"0.6"`` gives one radius for every joint; ``"0.6,0.5,..."`` gives one per joint."""
+    values = [float(v) for v in text.split(",")]
+    return values[0] if len(values) == 1 else values
+
+
 def confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, n: int) -> np.ndarray:
     cm = np.zeros((n, n), dtype=np.int64)
     np.add.at(cm, (y_true, y_pred), 1)
@@ -246,6 +252,10 @@ def main() -> None:
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce", help="ce: weighted cross entropy; focal: FocalCrossEntropy")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--rgb-weight", type=float, default=0.5, help="weight of the RGB stream when fusing scores")
+    parser.add_argument(
+        "--sigma", type=parse_sigma, default=0.6,
+        help="Gaussian radius of the pose heatmaps: one value for all joints, or 17 comma-separated values, one per COCO joint",
+    )
     parser.add_argument("--patience", type=int, default=10, help="stop after this many epochs without a macro-F1 gain")
     parser.add_argument("--quality", choices=["all", "good"], default="all", help="which paired windows to use")
     parser.add_argument("--workers", type=int, default=4, help="data loading processes")
@@ -299,6 +309,7 @@ def main() -> None:
     config = EPAMNetConfig(
         num_classes=n_classes,
         rgb_weight=args.rgb_weight,
+        sigma=args.sigma,
         id2label=dict(enumerate(names)),
         label2id={n: i for i, n in enumerate(names)},
         **MODEL_OVERRIDES,

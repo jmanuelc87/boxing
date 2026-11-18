@@ -38,7 +38,8 @@ match. Here the pose and RGB streams see the same T frames by default, and the p
 strided only when their frame count is a multiple of the RGB one. The reference tracks one
 person's 17 joints. Here the two boxers' joints are separate channels (34 in all),
 so the pose stream can tell them apart. Their order is by track id and carries no role. The Gaussian width is not given in the paper text,
-so ``sigma`` defaults to 0.6, the value PoseC3D uses at 56x56.
+so ``sigma`` defaults to 0.6, the value PoseC3D uses at 56x56. It can be given per joint (one
+radius for each of the 17 COCO keypoints), e.g. a tighter radius for the face than for the hips.
 """
 
 from __future__ import annotations
@@ -55,21 +56,36 @@ NUM_JOINTS = 17
 NUM_PLAYERS = 2
 
 
+def sigma_per_joint(sigma: float | list[float], joints: int = NUM_JOINTS) -> torch.Tensor:
+    """Gaussian width of each joint as a ``(J, 1)`` column, so it broadcasts over the heatmap rows.
+
+    ``sigma`` is either one width for every joint or a list with one width per joint.
+    """
+    values = [float(sigma)] * joints if isinstance(sigma, (int, float)) else [float(s) for s in sigma]
+    if len(values) != joints:
+        raise ValueError(f"sigma has {len(values)} values, expected 1 or {joints} (one per joint)")
+    if min(values) <= 0:
+        raise ValueError("sigma must be positive for every joint")
+    return torch.tensor(values, dtype=torch.float32).reshape(joints, 1)
+
+
 def keypoints_to_heatmaps(
-    keypoints: torch.Tensor, size: int = 56, sigma: float = 0.6, min_score: float = 0.1
+    keypoints: torch.Tensor, size: int = 56, sigma: float | list[float] = 0.6, min_score: float = 0.1
 ) -> torch.Tensor:
     """Render keypoints as Gaussian heatmaps (paper Eq. 1), weighted by joint confidence.
 
     ``keypoints``: ``(B, P, T, J, 3)`` with x and y in [0, 1] of the crop. Returns
     ``(B, P*J, T, size, size)``. Joints with a score at or below ``min_score`` give an empty map.
+    ``sigma`` is one radius for all joints or one per joint (length J).
     """
     b, p, t, j, _ = keypoints.shape
     x = keypoints[..., 0] * size
     y = keypoints[..., 1] * size
     score = keypoints[..., 2] * (keypoints[..., 2] > min_score)
     grid = torch.arange(size, device=keypoints.device, dtype=keypoints.dtype) + 0.5
-    gx = torch.exp(-((grid - x.unsqueeze(-1)) ** 2) / (2 * sigma**2))  # (B, P, T, J, size)
-    gy = torch.exp(-((grid - y.unsqueeze(-1)) ** 2) / (2 * sigma**2))
+    s = sigma_per_joint(sigma, j).to(device=keypoints.device, dtype=keypoints.dtype)  # (J, 1)
+    gx = torch.exp(-((grid - x.unsqueeze(-1)) ** 2) / (2 * s**2))  # (B, P, T, J, size)
+    gy = torch.exp(-((grid - y.unsqueeze(-1)) ** 2) / (2 * s**2))
     heat = score[..., None, None] * gy[..., :, None] * gx[..., None, :]  # (B, P, T, J, size, size)
     return heat.permute(0, 1, 3, 2, 4, 5).reshape(b, p * j, t, size, size)
 
@@ -235,7 +251,8 @@ class EPAMNetConfig(PreTrainedConfig):
         num_classes: number of punch classes. Class names go in ``id2label``.
         heatmap_size: side of the pose heatmaps in pixels (56 pairs with 224x224 RGB, both ending
             at a 7x7 feature map).
-        sigma: Gaussian width of a joint in heatmap pixels.
+        sigma: Gaussian width of a joint in heatmap pixels: one value for all joints, or a list
+            with one value per joint (17, in COCO order).
         min_score: joints at or below this confidence are left out of the heatmaps.
         rgb_blocks / pose_blocks: blocks per stage of each stream. The defaults are X3D-M (3, 5,
             11, 7) for RGB and its last three stages (5, 11, 7) for pose.
@@ -250,7 +267,7 @@ class EPAMNetConfig(PreTrainedConfig):
         self,
         num_classes: int = 8,
         heatmap_size: int = 56,
-        sigma: float = 0.6,
+        sigma: float | list[float] = 0.6,
         min_score: float = 0.1,
         rgb_blocks: tuple[int, ...] = (3, 5, 11, 7),
         pose_blocks: tuple[int, ...] = (5, 11, 7),
@@ -262,7 +279,8 @@ class EPAMNetConfig(PreTrainedConfig):
     ):
         self.num_classes = num_classes
         self.heatmap_size = heatmap_size
-        self.sigma = sigma
+        # A per-joint list is kept as a list so the config stays plain JSON.
+        self.sigma = list(sigma) if isinstance(sigma, (list, tuple)) else sigma
         self.min_score = min_score
         # JSON turns tuples into lists; keep them tuples so a reloaded config compares equal.
         self.rgb_blocks, self.pose_blocks = tuple(rgb_blocks), tuple(pose_blocks)

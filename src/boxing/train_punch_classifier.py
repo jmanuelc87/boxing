@@ -144,8 +144,8 @@ features guiding the RGB stream's attention. The two streams' softmax scores are
 ## Input
 
 * `images`: `(B, 16, 3, 224, 224)`, one square crop around both boxers, ImageNet-normalised RGB.
-* `keypoints`: `(B, 2, 16, 17, 3)`, COCO joints `(x, y, score)` of the attacker and the opponent, with
-  `x` and `y` in `[0, 1]` of the same crop.
+* `keypoints`: `(B, 2, 16, 17, 3)`, COCO joints `(x, y, score)` of the two boxers, ordered by their
+  DeepSORT track id (no attacker/opponent role), with `x` and `y` in `[0, 1]` of the same crop.
 
 ## Usage
 

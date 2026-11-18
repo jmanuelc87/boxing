@@ -1,34 +1,38 @@
-"""Pair each punch sequence with its opponent, tracking the boxers with DeepSORT and Re-ID.
+"""Pair each punch sequence with the two boxers in it, identified by DeepSORT track ids.
 
 Reads the punch-seq clips (``train.jsonl`` / ``val.jsonl`` written by
 ``boxing.preprocess``), the frames they point to, and the per-frame pose JSONs (written by
-``boxing.keypoints``). For every 16-frame window it finds the attacking boxer and the opponent
-in each frame and writes one array per split:
+``boxing.keypoints``). For every 16-frame window it finds the two boxers and writes one array
+per split:
 
-    X[N, 2, T, 17, 3]   row 0 = attacker, row 1 = opponent
+    X[N, 2, T, 17, 3]   row r = the r-th boxer of the window, ordered by DeepSORT track id
                         last axis = (x, y, score) in source pixels
                         missing people are zero-filled with score 0
 
-Identity comes from a tracker, not from "the nearest person to where the attacker was". Each
-person box is cropped from the frame and embedded by a Re-ID network; DeepSORT (Kalman motion
-model + appearance matching) gives every person a track id that survives clinches, where two
-boxers overlap and nearest-centre matching swaps them.
+Identity comes from a tracker, not from "the nearest person to where they were". Each person box
+is cropped from the frame and embedded by a Re-ID network; DeepSORT (Kalman motion model +
+appearance matching) gives every person a track id that survives clinches, where two boxers
+overlap and nearest-centre matching swaps them.
 
     1. Track every person through the window (forward, one DeepSORT per clip).
-    2. The attacker is the person whose box contains the labeled punch box. Their track id is
-       followed through the window; the opponent's track id likewise.
-    3. The punch box seeds the attacker on the anchor frame and is then ignored while the track
-       exists. Re-binding to the punch box on every labelled frame (``--glove-rebind``) caused
-       most identity swaps in validation, so it is off by default.
-    4. If a track is lost, the nearest person to the last known position is used as a fallback.
+    2. The two tracks seen in the most frames are the boxers (ties: the larger mean box).
+    3. Row 0 is the boxer with the lower track id, row 1 the other. DeepSORT numbers tracks in the
+       order it creates them, so this is the boxer seen first. The ids restart for every window:
+       row 0 of one window is not the same person as row 0 of another.
+    4. If a track is not matched on a frame, the nearest person to its last known position that is
+       not the other boxer fills in.
 
-Outputs in ``--dst`` are the same as before (consumers of ``punch-pairs`` need no change):
+No role (attacker, opponent) is assigned and the labeled punch box is not used.
+
+Outputs in ``--dst``:
     train.npz, val.npz    X (float32) and y (int64, class id)
     train.jsonl, val.jsonl  one metadata row per window, aligned with X
     labels.json           copied from ``--src``
 
-The metadata gains ``attacker_tracks`` (distinct track ids the attacker was assigned; 1 means a
-stable identity) and ``attacker_method`` now counts ``track`` and ``nearest`` (fallback) frames.
+The metadata has ``track_ids`` (the two DeepSORT ids, row order), ``track_frames`` (frames each
+row was filled), ``method`` (counts of ``track`` frames, ``nearest`` fallback frames and empty
+ones) and ``quality``: ``good`` when both boxers are present on every frame, ``partial`` when
+some are missing, ``no_boxers`` when none was found.
 
 Usage:
     python -m boxing.pairing --src data/processed/punch-seq \\
@@ -47,7 +51,7 @@ import json
 import logging
 import os
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache, partial
@@ -61,6 +65,7 @@ from tqdm import tqdm
 log = logging.getLogger("boxing.pairing")
 
 NUM_KEYPOINTS = 17
+N_BOXERS = 2
 SPLITS = ("train", "val")
 MIN_CROP = 2  # pixels; smaller crops cannot be embedded
 
@@ -74,7 +79,6 @@ class TrackConfig:
     n_init: int = 2  # hits before a track is confirmed
     max_cosine_distance: float = 0.3
     max_iou_distance: float = 0.7
-    rebind_by_glove: bool = False  # True re-binds the track to the punch box when it disagrees; off by default (see --glove-rebind)
 
 
 # --------------------------------------------------------------------------------------
@@ -153,18 +157,6 @@ def _center(box: np.ndarray) -> np.ndarray:
     return np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2], dtype=np.float32)
 
 
-def _glove_px(frame: dict, width: int, height: int) -> np.ndarray | None:
-    """Center of the labeled punch box in pixels, or None for unlabeled frames."""
-    if not frame["class_labels"] or not frame["boxes"]:
-        return None
-    cx, cy, _, _ = frame["boxes"][0]
-    return np.array([cx * width, cy * height], dtype=np.float32)
-
-
-def _inside(box: np.ndarray, pt: np.ndarray) -> bool:
-    return box[0] <= pt[0] <= box[2] and box[1] <= pt[1] <= box[3]
-
-
 # --------------------------------------------------------------------------------------
 # Tracking
 # --------------------------------------------------------------------------------------
@@ -203,74 +195,68 @@ def track_window(
 
 
 # --------------------------------------------------------------------------------------
-# Choosing the attacker and the opponent
+# Choosing the two boxers
 # --------------------------------------------------------------------------------------
 
 
-def pick_attacker(
-    people: list[dict], glove: np.ndarray | None, ref: np.ndarray | None
-) -> tuple[int | None, str]:
-    """Index of the attacker in one frame from the punch box and/or the last position."""
-    if not people:
-        return None, "no_people"
-    if glove is not None:
-        inside = [i for i, p in enumerate(people) if _inside(p["box"], glove)]
-        if len(inside) == 1:
-            return inside[0], "glove_in_box"
-        if len(inside) > 1:
-            pool, how = inside, "glove_multi"
-        else:
-            pool, how = list(range(len(people))), "glove_nearest"
-        anchor = ref if ref is not None else glove
-        return min(pool, key=lambda i: np.linalg.norm(people[i]["center"] - anchor)), how
-    if ref is not None:
-        return min(range(len(people)), key=lambda i: np.linalg.norm(people[i]["center"] - ref)), "nearest"
-    return None, "unanchored"
+def _id_key(track_id: str) -> tuple[int, str]:
+    """Sort key putting numeric ids in numeric order ("2" before "10")."""
+    return (int(track_id), track_id) if str(track_id).isdigit() else (1 << 62, str(track_id))
 
 
-def pick_opponent(people: list[dict], attacker: int | None) -> int | None:
-    if attacker is None:
-        return None
-    others = [i for i in range(len(people)) if i != attacker]
-    if not others:
-        return None
-    ref = people[attacker]["center"]
-    return min(others, key=lambda i: np.linalg.norm(people[i]["center"] - ref))
+def pick_tracks(people: list[list[dict]], track_ids: list[dict[int, str]], n: int = N_BOXERS) -> list[str]:
+    """The ``n`` tracks seen in the most frames, ordered by track id.
+
+    Ties go to the track with the larger mean box, which is the boxer rather than a spectator.
+    """
+    frames: Counter = Counter()
+    area: defaultdict = defaultdict(float)
+    for frame_people, ids in zip(people, track_ids):
+        for i, tid in ids.items():
+            box = frame_people[i]["box"]
+            frames[tid] += 1
+            area[tid] += float((box[2] - box[0]) * (box[3] - box[1]))
+    best = sorted(frames, key=lambda tid: (-frames[tid], -area[tid] / frames[tid], _id_key(tid)))[:n]
+    return sorted(best, key=_id_key)
 
 
-def _step(
-    people: list[dict], ids: dict[int, str], glove: np.ndarray | None, state: dict, rebind: bool = True
-) -> tuple[int | None, int | None, str]:
-    """Attacker and opponent of one frame. ``state`` carries their track ids and last position."""
-    if not people:
-        return None, None, "no_people"
-    by_id = {tid: i for i, tid in ids.items()}
-    tracked = by_id.get(state["attacker"])
+def follow_tracks(
+    people: list[list[dict]], track_ids: list[dict[int, str]], tracks: list[str]
+) -> tuple[list[list[int | None]], list[list[str]]]:
+    """Person index of each track on each frame, and how it was found.
 
-    idx, how = pick_attacker(people, glove, state["ref"])
-    if glove is None:
-        if tracked is not None:
-            idx, how = tracked, "track"
-    elif not rebind and tracked is not None:
-        # Ablation: the track keeps the attacker identity; the punch box only seeds it.
-        idx, how = tracked, "track"
-    elif how == "glove_multi" and tracked is not None and _inside(people[tracked]["box"], glove):
-        idx, how = tracked, "track"
-    elif how == "glove_nearest" and tracked is not None:
-        idx, how = tracked, "track"
-    # An unambiguous "glove_in_box" always wins and re-binds the track below.
-
-    if idx is None:
-        return None, None, how
-    state["attacker"] = ids.get(idx)
-    state["ref"] = people[idx]["center"]
-
-    opp = by_id.get(state["opponent"])
-    if opp is None or opp == idx:
-        opp = pick_opponent(people, idx)
-    if opp is not None:
-        state["opponent"] = ids.get(opp)
-    return idx, opp, how
+    Returns ``(index[r][t], how[r][t])``. ``how`` is ``track`` (matched by DeepSORT), ``nearest``
+    (the track was not matched: the closest person to its last known position that is not the
+    other boxer), ``no_people`` or ``missing``.
+    """
+    T = len(people)
+    index: list[list[int | None]] = [[None] * T for _ in tracks]
+    how: list[list[str]] = [["missing"] * T for _ in tracks]
+    # Before a track first shows up, its first position is the best guess for where it is.
+    last: dict[str, np.ndarray] = {}
+    for frame_people, ids in zip(people, track_ids):
+        for i, tid in ids.items():
+            if tid in tracks:
+                last.setdefault(tid, frame_people[i]["center"])
+    for t in range(T):
+        if not people[t]:
+            for r in range(len(tracks)):
+                how[r][t] = "no_people"
+            continue
+        by_id = {tid: i for i, tid in track_ids[t].items()}
+        taken = {by_id[tid] for tid in tracks if tid in by_id}
+        for r, tid in enumerate(tracks):
+            if tid in by_id:
+                index[r][t], how[r][t] = by_id[tid], "track"
+            elif tid in last:
+                free = [i for i in range(len(people[t])) if i not in taken]
+                if free:
+                    idx = min(free, key=lambda i: np.linalg.norm(people[t][i]["center"] - last[tid]))
+                    taken.add(idx)
+                    index[r][t], how[r][t] = idx, "nearest"
+            if index[r][t] is not None:
+                last[tid] = people[t][index[r][t]]["center"]
+    return index, how
 
 
 def pair_record(rec: dict, kp_root: Path, img_root: Path, cfg: TrackConfig) -> tuple[np.ndarray, dict]:
@@ -279,46 +265,22 @@ def pair_record(rec: dict, kp_root: Path, img_root: Path, cfg: TrackConfig) -> t
     T = len(frames)
     W, H = rec["width"], rec["height"]
     people = [load_people(kp_root, f["image"]) for f in frames]
-    gloves = [_glove_px(f, W, H) for f in frames]
     track_ids = track_window(people, [img_root / f["image"] for f in frames], cfg)
 
-    attacker: list[int | None] = [None] * T
-    opponent: list[int | None] = [None] * T
-    attacker_track: list[str | None] = [None] * T
-    how = ["none"] * T
+    tracks = pick_tracks(people, track_ids)
+    index, how = follow_tracks(people, track_ids, tracks)
 
-    labeled = [t for t in range(T) if gloves[t] is not None]
-    if labeled:
-        anchor = labeled[0]
-        # Seed the anchor frame, then walk outwards in both directions with the same identities.
-        seed = {"attacker": None, "opponent": None, "ref": None}
-        attacker[anchor], opponent[anchor], how[anchor] = _step(
-            people[anchor], track_ids[anchor], gloves[anchor], seed, cfg.rebind_by_glove
-        )
-        attacker_track[anchor] = seed["attacker"]
-        for order in (range(anchor + 1, T), range(anchor - 1, -1, -1)):
-            state = dict(seed)
-            for t in order:
-                attacker[t], opponent[t], how[t] = _step(people[t], track_ids[t], gloves[t], state, cfg.rebind_by_glove)
-                attacker_track[t] = state["attacker"] if attacker[t] is not None else None
+    window = np.zeros((N_BOXERS, T, NUM_KEYPOINTS, 3), dtype=np.float32)
+    for r, row in enumerate(index):
+        for t, i in enumerate(row):
+            if i is not None:
+                window[r, t] = people[t][i]["kps"]
 
-    window = np.zeros((2, T, NUM_KEYPOINTS, 3), dtype=np.float32)
-    opponent_missing = 0
-    for t in range(T):
-        a = attacker[t]
-        if a is None:
-            continue
-        window[0, t] = people[t][a]["kps"]
-        o = opponent[t]
-        if o is None:
-            opponent_missing += 1
-        else:
-            window[1, t] = people[t][o]["kps"]
-
-    n_attacker = sum(a is not None for a in attacker)
-    if n_attacker == 0:
-        quality = "no_attacker"
-    elif n_attacker == T and opponent_missing == 0:
+    filled = [sum(i is not None for i in row) for row in index]
+    filled += [0] * (N_BOXERS - len(filled))  # fewer than two boxers were tracked
+    if sum(filled) == 0:
+        quality = "no_boxers"
+    elif all(n == T for n in filled):
         quality = "good"
     else:
         quality = "partial"
@@ -330,12 +292,10 @@ def pair_record(rec: dict, kp_root: Path, img_root: Path, cfg: TrackConfig) -> t
         "start": rec["start"],
         "width": W,
         "height": H,
-        "n_labeled": len(labeled),
-        "attacker_frames": n_attacker,
-        "opponent_missing_frames": opponent_missing,
+        "track_ids": tracks,
+        "track_frames": filled,
         "quality": quality,
-        "attacker_method": dict(Counter(how)),
-        "attacker_tracks": len({tid for tid in attacker_track if tid is not None}),
+        "method": dict(Counter(h for row in how for h in row)),
     }
     return window, meta
 
@@ -368,8 +328,8 @@ def process_split(
     with (dst / f"{split}.jsonl").open("w", encoding="utf-8") as fh:
         for m in metas:
             fh.write(json.dumps(m) + "\n")
-    stable = sum(m["attacker_tracks"] == 1 for m in metas)
-    log.info("%s: %d windows %s, attacker identity stable in %d", split, len(records), dict(quality), stable)
+    tracked = sum(m["method"].get("nearest", 0) == 0 for m in metas)
+    log.info("%s: %d windows %s, %d without any nearest-person fallback", split, len(records), dict(quality), tracked)
     return quality
 
 
@@ -377,7 +337,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
         prog="python -m boxing.pairing",
-        description="Pair each punch sequence with its opponent, tracking the boxers with DeepSORT and Re-ID.",
+        description="Pair each punch sequence with its two boxers, identified by DeepSORT track ids and Re-ID.",
     )
     parser.add_argument("--src", type=Path, default=Path("data/processed/punch-seq"), help="punch-seq directory with train/val jsonl, labels.json and images/")
     parser.add_argument("--keypoints", type=Path, default=Path("data/processed/punch-keypoints-boxers/images"), help="root of the per-frame keypoint JSONs")
@@ -389,7 +349,6 @@ def main() -> None:
     parser.add_argument("--n-init", type=int, default=TrackConfig.n_init, help="hits before a track is confirmed")
     parser.add_argument("--max-cosine-distance", type=float, default=TrackConfig.max_cosine_distance, help="appearance gate: larger matches looser")
     parser.add_argument("--max-iou-distance", type=float, default=TrackConfig.max_iou_distance, help="motion gate on box overlap")
-    parser.add_argument("--glove-rebind", action="store_true", help="re-bind the attacker's track to the punch box when they disagree (off by default: it caused most swaps)")
     args = parser.parse_args()
 
     if not args.src.is_dir():
@@ -403,7 +362,6 @@ def main() -> None:
         n_init=args.n_init,
         max_cosine_distance=args.max_cosine_distance,
         max_iou_distance=args.max_iou_distance,
-        rebind_by_glove=args.glove_rebind,
     )
     args.dst.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(args.src / "labels.json", args.dst / "labels.json")

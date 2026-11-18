@@ -95,7 +95,12 @@ def _get_embedder(cfg: TrackConfig):
     global _EMBEDDER, _EMBEDDER_KEY
     key = cfg.cpu
     if _EMBEDDER is None or _EMBEDDER_KEY != key:
-        from deep_sort_realtime.embedder import embedder_pytorch
+        import warnings
+
+        # deep_sort_realtime imports pkg_resources, which warns on every import (third-party, not fixable here).
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
+            from deep_sort_realtime.embedder import embedder_pytorch
 
         _EMBEDDER = embedder_pytorch.MobileNetv2_Embedder(half=True, bgr=True, gpu=not cfg.cpu)
         _EMBEDDER_KEY = key

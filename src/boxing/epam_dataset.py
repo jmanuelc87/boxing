@@ -21,6 +21,7 @@ joints swapped, so the class is unchanged), and brightness and contrast jitter.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -115,6 +116,12 @@ class EPAMDataset(Dataset):
 
         wanted = {"good"} if quality == "good" else {"good", "partial"}
         keep = np.flatnonzero([m["quality"] in wanted for m in meta])
+        if len(keep) == 0 and len(meta) > 0:
+            counts = dict(Counter(m["quality"] for m in meta))
+            raise ValueError(
+                f"{split}: none of the {len(meta)} paired windows has quality in {sorted(wanted)} (found {counts}). "
+                "If they are all 'no_boxers', the keypoints are missing or empty: re-run boxing.keypoints, then boxing.pairing."
+            )
         if limit is not None and limit < len(keep):
             keep = keep[np.linspace(0, len(keep) - 1, limit).astype(int)]
         self.indices = keep

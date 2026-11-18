@@ -328,6 +328,13 @@ def process_split(
     with (dst / f"{split}.jsonl").open("w", encoding="utf-8") as fh:
         for m in metas:
             fh.write(json.dumps(m) + "\n")
+    if records and quality["no_boxers"] == len(records):
+        found = sum(1 for _ in kp_root.rglob("*.json"))
+        log.warning(
+            "%s: no boxer found in any of the %d windows. %d keypoint JSON files under %s: "
+            "run boxing.keypoints first and check it wrote people for these frames.",
+            split, len(records), found, kp_root,
+        )
     tracked = sum(m["method"].get("nearest", 0) == 0 for m in metas)
     log.info("%s: %d windows %s, %d without any nearest-person fallback", split, len(records), dict(quality), tracked)
     return quality

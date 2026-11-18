@@ -138,3 +138,13 @@ def test_lr_factor_warms_up_then_decays():
     assert f(10) == pytest.approx(1.0)
     assert f(99) < f(50) < f(10)
     assert f(99) >= 0.01
+
+
+def test_a_split_with_no_usable_windows_explains_why(data):
+    pairs, src = data
+    rows = [json.loads(line) for line in (pairs / "train.jsonl").read_text().splitlines()]
+    for r in rows:
+        r["quality"] = "no_boxers"
+    (pairs / "train.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    with pytest.raises(ValueError, match="no_boxers"):
+        EPAMDataset(pairs, src, "train")

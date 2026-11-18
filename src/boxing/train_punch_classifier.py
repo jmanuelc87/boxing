@@ -8,8 +8,7 @@ and the pose head), summed. Predictions fuse the two streams' softmax scores. Th
 (decoupled weight decay) with a cosine schedule with warm-up. The reference implementation uses SGD.
 
 Train and validation are separate fights, so the score reflects unseen fights. The checkpoint with
-the best validation macro F1 of the fused prediction is kept, since accuracy alone is dominated by
-the common "Jab a la cabeza" class.
+the best validation accuracy of the fused prediction is kept.
 
 The best model is saved with ``save_pretrained`` (``best/``: ``model.safetensors``, ``config.json``,
 the model code and a model card) and, unless ``--no-push``, uploaded to the Hugging Face Hub repo
@@ -172,9 +171,9 @@ first if you do not trust the source.
 
 ## Validation results
 
-The best epoch ({best_epoch}) by fused macro F1 on the validation split. Train and validation are
-separate fights, so these scores are on fights the model did not see. Accuracy alone is dominated by
-the most common class, so the macro F1 is the number to watch.
+The best epoch ({best_epoch}) by fused accuracy on the validation split. Train and validation are
+separate fights, so these scores are on fights the model did not see. Macro F1 is shown beside
+accuracy because accuracy alone is dominated by the most common class.
 
 | | accuracy | macro F1 |
 |---|---|---|
@@ -260,7 +259,7 @@ def main() -> None:
         "--sigma", type=parse_sigma, default=0.6,
         help="Gaussian radius of the pose heatmaps: one value for all joints, or 17 comma-separated values, one per COCO joint",
     )
-    parser.add_argument("--patience", type=int, default=10, help="stop after this many epochs without a macro-F1 gain")
+    parser.add_argument("--patience", type=int, default=10, help="stop after this many epochs without an accuracy gain")
     parser.add_argument("--quality", choices=["all", "good"], default="all", help="which paired windows to use")
     parser.add_argument("--workers", type=int, default=4, help="data loading processes")
     parser.add_argument("--device", default=None, help="cuda or cpu (default: cuda if available, else cpu)")
@@ -352,13 +351,14 @@ def main() -> None:
             config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
             job_type="train",
         )
-    best_f1, best_epoch, history = -1.0, 0, []
+    best_acc, best_epoch, history = -1.0, 0, []
     for epoch in range(1, args.epochs + 1):
         started = time.time()
         loss = train_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every
         )
         val = evaluate(model, val_loader, device, n_classes, args.rgb_weight)
+        acc = val["fused"]["accuracy"]
         f1 = val["fused"]["macro_f1"]
         row = {
             "epoch": epoch,
@@ -386,10 +386,10 @@ def main() -> None:
                 step=scheduler.last_epoch,
             )
         marker = ""
-        if f1 > best_f1:
-            best_f1, best_epoch, marker = f1, epoch, " *"
+        if acc > best_acc:
+            best_acc, best_epoch, marker = acc, epoch, " *"
             model.save_pretrained(best_dir)
-            push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val macro F1 {f1:.3f}")
+            push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val accuracy {acc:.3f}")
         print(
             f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  macro F1 {f1:.3f} "
             f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  "
@@ -401,7 +401,7 @@ def main() -> None:
                 "epoch": epoch,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "best_f1": best_f1,
+                "best_acc": best_acc,
                 "best_epoch": best_epoch,
                 "history": history,
             },
@@ -409,14 +409,14 @@ def main() -> None:
         )
         push_folder(api, args.hub_repo, ckpt_dir, "checkpoints/last", f"Checkpoint: epoch {epoch}")
         if epoch - best_epoch >= args.patience:
-            print(f"no macro-F1 gain for {args.patience} epochs, stopping")
+            print(f"no accuracy gain for {args.patience} epochs, stopping")
             break
 
     # Report the best checkpoint, reloaded from disk into a fresh model, not the last epoch.
     reloaded = EPAMNet.from_pretrained(best_dir).to(device)
     final = evaluate(reloaded, val_loader, device, n_classes, reloaded.config.rgb_weight)
-    if args.test and not math.isclose(final["fused"]["macro_f1"], best_f1, abs_tol=1e-6):
-        raise RuntimeError(f"reloaded checkpoint scores {final['fused']['macro_f1']:.4f}, expected {best_f1:.4f}")
+    if args.test and not math.isclose(final["fused"]["accuracy"], best_acc, abs_tol=1e-6):
+        raise RuntimeError(f"reloaded checkpoint scores {final['fused']['accuracy']:.4f}, expected {best_acc:.4f}")
     print(f"\nbest epoch {best_epoch}" + ("  (checkpoint reload verified)" if args.test else ""))
     print("fused prediction:")
     print_report(final["fused"], names)

@@ -1,11 +1,11 @@
 """Train EPAM-Net on RGB clips and keypoints from the windows written by ``boxing.pairing``.
 
-    uv run python -m boxing.train_punch_classifier [--epochs 30] [--batch-size 8] [--lr 0.01]
+    uv run python -m boxing.train_punch_classifier [--epochs 30] [--batch-size 8] [--lr 1e-3]
     uv run python -m boxing.train_punch_classifier --test      # smoke test, see below
 
 Both streams are trained at once with a classification loss on each head (the attended RGB head
-and the pose head), summed. Predictions fuse the two streams' softmax scores. The optimiser is SGD
-with momentum and a cosine schedule with warm-up, as in the reference implementation.
+and the pose head), summed. Predictions fuse the two streams' softmax scores. The optimiser is AdamW
+(decoupled weight decay) with a cosine schedule with warm-up. The reference implementation uses SGD.
 
 Train and validation are separate fights, so the score reflects unseen fights. The checkpoint with
 the best validation macro F1 of the fused prediction is kept, since accuracy alone is dominated by
@@ -188,7 +188,7 @@ the most common class, so the macro F1 is the number to watch.
 
 ## Training
 
-SGD (momentum {args.momentum}, weight decay {args.weight_decay}), learning rate {args.lr} with a
+AdamW (weight decay {args.weight_decay}), peak learning rate {args.lr} with a
 {args.warmup_epochs:g}-epoch warm-up then cosine decay, batch size {args.batch_size},
 {args.loss} loss (label smoothing {args.label_smoothing}), inverse-square-root class weights,
 seed {args.seed}. Windows quality filter: `{args.quality}`.
@@ -211,12 +211,20 @@ def push_folder(api: HfApi | None, repo: str, folder: Path, path_in_repo: str, m
         print(f"warning: upload of {folder} to {repo}:{path_in_repo} failed ({exc})")
 
 
+GRAD_CLIP = 5.0
+
+
 def train_epoch(
     model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int, log_every: int = 0
-) -> float:
-    """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many steps."""
+) -> tuple[float, dict[str, float]]:
+    """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many steps.
+
+    Returns the mean loss and the gradient-norm statistics: the norm before clipping at ``GRAD_CLIP``,
+    its mean and max over the epoch, and the share of steps that were clipped.
+    """
     model.train()
     total, seen = 0.0, 0
+    norms = []
     bar = tqdm(loader, desc=f"epoch {epoch}/{epochs}", leave=False)
     for images, keypoints, y in bar:
         images, keypoints, y = images.to(device), keypoints.to(device), y.to(device)
@@ -224,7 +232,7 @@ def train_epoch(
         loss = criterion(out.rgb_logits, y) + criterion(out.pose_logits, y)
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        norms.append(float(nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)))  # returns the norm before clipping
         optimizer.step()
         scheduler.step()
         total += loss.item() * len(y)
@@ -235,7 +243,12 @@ def train_epoch(
                 {"step/loss": loss.item(), "step/lr": optimizer.param_groups[0]["lr"], "epoch": epoch},
                 step=scheduler.last_epoch,
             )
-    return total / seen
+    grad = {
+        "grad_norm_mean": float(np.mean(norms)) if norms else 0.0,
+        "grad_norm_max": float(np.max(norms)) if norms else 0.0,
+        "clipped_share": float(np.mean(np.asarray(norms) > GRAD_CLIP)) if norms else 0.0,
+    }
+    return total / seen, grad
 
 
 def main() -> None:
@@ -245,9 +258,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None, help="default: runs/epam-net, or runs/epam-test with --test")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--weight-decay", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-3, help="peak AdamW learning rate")
+    parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW decoupled weight decay")
     parser.add_argument("--warmup-epochs", type=float, default=1.0)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce", help="ce: weighted cross entropy; focal: FocalCrossEntropy")
@@ -326,7 +338,7 @@ def main() -> None:
         print(f"pose backbone initialised from {args.init_pose.name}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"parameters {n_params / 1e6:.2f}M")
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(args.warmup_epochs * steps_per_epoch))
@@ -354,7 +366,7 @@ def main() -> None:
     best_f1, best_epoch, history = -1.0, 0, []
     for epoch in range(1, args.epochs + 1):
         started = time.time()
-        loss = train_epoch(
+        loss, grad = train_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every
         )
         val = evaluate(model, val_loader, device, n_classes, args.rgb_weight)
@@ -368,6 +380,7 @@ def main() -> None:
             "val_macro_f1_rgb": val["rgb"]["macro_f1"],
             "val_macro_f1_pose": val["pose"]["macro_f1"],
             "seconds": time.time() - started,
+            **grad,
         }
         history.append(row)
         if run is not None:
@@ -380,6 +393,9 @@ def main() -> None:
                     "epoch/val_macro_f1_rgb": row["val_macro_f1_rgb"],
                     "epoch/val_macro_f1_pose": row["val_macro_f1_pose"],
                     "epoch/seconds": row["seconds"],
+                    "epoch/grad_norm_mean": grad["grad_norm_mean"],
+                    "epoch/grad_norm_max": grad["grad_norm_max"],
+                    "epoch/clipped_share": grad["clipped_share"],
                     "epoch": epoch,
                 },
                 step=scheduler.last_epoch,
@@ -391,7 +407,9 @@ def main() -> None:
             push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val macro F1 {f1:.3f}")
         print(
             f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  macro F1 {f1:.3f} "
-            f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  {row['seconds']:.0f}s{marker}"
+            f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  "
+            f"grad {grad['grad_norm_mean']:.2f} max {grad['grad_norm_max']:.2f} clipped {grad['clipped_share']:.0%}  "
+            f"{row['seconds']:.0f}s{marker}"
         )
         model.save_pretrained(ckpt_dir)
         torch.save(

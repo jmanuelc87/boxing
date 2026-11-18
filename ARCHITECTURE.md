@@ -16,7 +16,7 @@ Pose-driven, attention-guided two-stream network for punch recognition, implemen
 ```mermaid
 flowchart TD
     IMG["images<br/>(B, T, 3, 224, 224)"] --> PERM["permute to (B, 3, T, H, W)"]
-    KP["keypoints<br/>(B, 2, T, 17, 3)"] --> HM["keypoints_to_heatmaps<br/>Gaussian, sigma=0.6<br/>(B, 34, T, 56, 56)"]
+    KP["keypoints<br/>(B, 2, T, 17, 3)"] --> HM["keypoints_to_heatmaps<br/>Gaussian, sigma 0.6<br/>(per joint optional)<br/>(B, 34, T, 56, 56)"]
 
     subgraph RGB["RGB stream"]
         PERM --> RB["X-ShiftNet-M<br/>4 stages, stem stride 2<br/>blocks 3-5-11-7"]
@@ -45,6 +45,12 @@ flowchart TD
     FUSE --> PROB["class probabilities"]
 ```
 
+## Pose heatmaps
+
+`keypoints_to_heatmaps` renders each joint as a Gaussian at its `(x, y)` position on a 56x56 grid, scaled by its confidence. Joints with a score at or below `min_score` (0.1) give an empty map. The channels are ordered boxer 0's 17 joints, then boxer 1's.
+
+`sigma` (the Gaussian radius, in heatmap pixels) is either one value for every joint (default 0.6) or a list of 17, one per COCO joint, so each keypoint can have its own radius. A list must have 17 positive values. Set it with `EPAMNetConfig(sigma=...)` or `--sigma` on the training script.
+
 ## X-ShiftNet backbone
 
 Used for both streams with different depth, width and stem stride. All convolutions are 2D (`1x3x3` kernels inside `Conv3d`), and temporal mixing comes from the parameter-free Temporal Shift Module. The frame count is never reduced.
@@ -64,14 +70,14 @@ flowchart TD
 
 ### ShiftBlock
 
-Inverted residual block. The shift sits on the residual branch only, so the shortcut keeps the original frames. Squeeze-and-excitation is used on every other block (`(i + 1) % 2 == 0`).
+Inverted residual block. The shift sits on the residual branch only, so the shortcut keeps the original frames. Squeeze-and-excitation is used on every other block, starting with the first (`i % 2 == 0`, i.e. blocks 0, 2, 4, ...), and its hidden width is the block's inner width divided by 16, rounded to a multiple of 8 with a minimum of 8 (54 gives 8, 216 gives 16). The shift, SE placement and SE width follow the official EPAM-Net code, so its pretrained weights fit.
 
 ```mermaid
 flowchart LR
-    X["x"] --> TS["TemporalShift<br/>1/8 channels forward,<br/>1/8 backward in time"]
+    X["x"] --> TS["TemporalShift<br/>1/div channels take the next frame,<br/>1/div the previous frame<br/>(div 8 RGB, 4 pose)"]
     TS --> EX["1x1 expand<br/>Conv + BN + ReLU"]
     EX --> DW["1x3x3 depthwise<br/>Conv + BN<br/>stride 1 or 2"]
-    DW --> SE["SqueezeExcite3d<br/>(every other block)"]
+    DW --> SE["SqueezeExcite3d<br/>(blocks 0, 2, 4, ...)"]
     SE --> SI["SiLU"]
     SI --> PR["1x1 project<br/>Conv + BN"]
     PR --> ADD(("+"))
@@ -108,3 +114,13 @@ Each stream has its own head: `Dropout(0.5)`, global average pool over (T, H, W)
 flowchart LR
     F["features<br/>(B, C, T, H, W)"] --> GAP["adaptive avg pool 3D"] --> DO["Dropout"] --> FC["Linear"] --> L["logits<br/>(B, num_classes)"]
 ```
+
+## Temporal shift
+
+`TemporalShift` moves the first `C // div` channels to the next frame (`out[t] = x[t + 1]`) and the next `C // div` channels to the previous frame (`out[t] = x[t - 1]`). Frames shifted past either end are zero-filled, and the rest of the channels are untouched. It has no parameters. The divisor is `rgb_shift_div` (8) for the RGB stream and `pose_shift_div` (4) for the pose stream, the values the official code uses.
+
+## Pretrained backbones
+
+`boxing.pretrained.load_official_backbone` loads the official EPAM-Net backbones (mmaction checkpoints, e.g. NTU RGB+D 120) into `rgb_backbone` or `pose_backbone`. It renames the keys (`layerN.i.conv1` to `stages.N-1.i.expand`, and so on) and loads strictly, so any shape or key mismatch raises. The heads and the attention block are not loaded. The official pose stem has 17 input channels (one person), so it is copied for both boxers and divided by 2. On the training script, use `--init-rgb` and `--init-pose`.
+
+Checkpoints saved before the layout above (SE on odd blocks, a single shift fold of 8, the opposite shift direction) do not load into the current model.

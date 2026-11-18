@@ -13,8 +13,8 @@ flowchart TB
     raw["Raw data<br/>CVAT tracks + 1920x1080 50 fps video"]
     clips["Clips<br/>16 frames, 640x360 JPEG,<br/>a punch box and class per frame"]
     kp["Per-frame keypoints<br/>17 COCO joints per person,<br/>red and blue boxers only"]
-    pairs["Paired windows<br/>(2, 16, 17, 3): attacker, opponent,<br/>pixel x, y, score"]
-    norm["Normalised windows<br/>origin = attacker hip centre,<br/>scale = attacker torso length"]
+    pairs["Paired windows<br/>(2, 16, 17, 3): two boxers by track id,<br/>pixel x, y, score"]
+    norm["Normalised windows<br/>origin = first boxer hip centre,<br/>scale = first boxer torso length"]
     crops["RGB crops 224x224<br/>16 frames, one square crop around both boxers"]
     heat["Pose heatmaps 56x56<br/>34 Gaussian channels per frame"]
     model["EPAM-Net<br/>RGB and pose streams, pose-guided attention"]
@@ -61,7 +61,7 @@ uv run python -m boxing.train_punch_classifier          # full training run
 
 *Skeletons on every detected person. The label is the clip's class (here "Cruzado fallido").*
 
-**Stage 2 with the boxer filter.** The role classifier drops the referee and everyone else, keeping the red and blue boxers. Those two skeletons are what `boxing.pairing` turns into the attacker and the opponent:
+**Stage 2 with the boxer filter.** The role classifier drops the referee and everyone else, keeping the red and blue boxers. Those two skeletons are what `boxing.pairing` turns into the two boxers of each window:
 
 ![Keypoints on the two boxers only](media/keypoints-two-players.gif)
 
@@ -250,7 +250,7 @@ By default it keeps only the red and blue boxers, using the trained role model (
 
 ## Paired windows
 
-`boxing.pairing` joins each clip with the keypoints of the boxers in it. For each clip it picks the attacker (the boxer whose glove box contains the punch) and the opponent (the other person nearest the attacker), then follows both through the 16 frames.
+`boxing.pairing` joins each clip with the keypoints of the boxers in it. Each person in every frame is tracked with DeepSORT, using a Kalman motion model and a Re-ID appearance embedding, so the track id survives clinches where two boxers overlap. For each clip the two tracks seen in the most frames are the boxers, and they are ordered by track id. No role is assigned: the labeled punch box is not used. Row 0 is the boxer with the lower track id, which is not the same person from one window to the next. If a track is not matched on a frame, the nearest unmatched person to its last position fills in.
 
 ```bash
 uv run python -m boxing.pairing \
@@ -261,11 +261,11 @@ uv run python -m boxing.pairing \
 
 Output in `--dst`:
 
-- `train.npz` and `val.npz`: `X` with shape `(N, 2, 16, 17, 3)` (row 0 attacker, row 1 opponent; last axis `x, y, score` in pixels) and `y` with the class id. Missing people are zero-filled with score 0.
-- `train.jsonl` and `val.jsonl`: one metadata row per window, aligned with `X`. Each row has a `quality` field: `good` (attacker and opponent present on every frame), `partial` (some frames without an opponent), or `no_attacker`.
+- `train.npz` and `val.npz`: `X` with shape `(N, 2, 16, 17, 3)` (row 0 the first boxer, row 1 the second, ordered by track id; last axis `x, y, score` in pixels) and `y` with the class id. Missing people are zero-filled with score 0.
+- `train.jsonl` and `val.jsonl`: one metadata row per window, aligned with `X`. Each row has `track_ids` (the two DeepSORT ids in row order), `track_frames` (frames each row was filled), `method` (counts of `track`, `nearest` and `missing` frames) and a `quality` field: `good` (both boxers present on every frame), `partial` (some frames missing a boxer), or `no_boxers`.
 - `labels.json`: copied from `--src`.
 
-Windows from the same fight never appear in both splits. The `good`/`partial` split is a warning, not a filter: most `partial` windows are missing the opponent on a few frames only.
+Windows from the same fight never appear in both splits. The `good`/`partial` split is a warning, not a filter: most `partial` windows are missing a boxer on a few frames only.
 
 ## Train EPAM-Net
 
@@ -302,7 +302,7 @@ uv run python -m boxing.train_punch_classifier --epochs 40 --batch-size 8 --lr 0
 | `--label-smoothing` | 0.05 | smoothing for the cross entropy |
 | `--rgb-weight` | 0.5 | weight of the RGB stream when the two streams' scores are fused |
 | `--patience` | 10 | stop after this many epochs without a gain in validation macro F1 |
-| `--quality` | `all` | `all` keeps every window with an attacker; `good` keeps only windows with both boxers on every frame |
+| `--quality` | `all` | `all` keeps every window with at least one boxer tracked; `good` keeps only windows with both boxers on every frame |
 | `--workers` | 4 | data-loading processes |
 | `--device` | auto | `cuda` or `cpu` (cuda if available) |
 | `--seed` | 0 | random seed |
@@ -341,7 +341,7 @@ On the CPU, one training step of 4 clips takes about 1.6 s, so an epoch of the f
 
 ## Hand-crafted baseline
 
-`src/boxing/handcrafted_punch.py` reduces each window to about 160 statistics: wrist speed and extension, elbow angle, wrist-to-opponent distances, closing speed, shoulder and hip rotation, and body movement for both boxers. A gradient-boosting classifier is trained on them with the same split and metrics.
+`src/boxing/handcrafted_punch.py` reduces each window to about 160 statistics: wrist speed and extension, elbow angle, wrist-to-other-boxer distances, closing speed, shoulder and hip rotation, and body movement for both boxers. A gradient-boosting classifier is trained on them with the same split and metrics.
 
 It needs scikit-learn, which is not a project dependency:
 

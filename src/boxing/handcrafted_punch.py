@@ -8,8 +8,9 @@ Uses the same normalised windows, the same fight-disjoint train/val split and th
 
 Each window is reduced to per-stream statistics (max, min, mean, std, range, and the relative
 position of the peak in time) over: wrist speed, wrist-to-own-shoulder extension, elbow angle,
-wrist-to-opponent distances, closing speed toward the opponent, shoulder and hip rotation, torso
-lean, and body movement for both boxers. Missing joints are NaN, which the booster handles natively.
+wrist-to-other-boxer distances, closing speed toward the other boxer, shoulder and hip rotation,
+torso lean, and body movement for both boxers. Each boxer is one of the two rows, ordered by track id,
+so ``b0_`` features describe the first boxer and ``b1_`` the second, whichever of them is punching. Missing joints are NaN, which the booster handles natively.
 """
 
 from __future__ import annotations
@@ -84,40 +85,40 @@ def _mid(xy: np.ndarray, i: int, j: int) -> np.ndarray:
 
 
 def window_features(w: np.ndarray) -> dict[str, float]:
-    """Features for one normalised window ``(2, T, 17, 3)``; row 0 attacker, row 1 opponent."""
+    """Features for one normalised window ``(2, T, 17, 3)``; row 0 is the first boxer, row 1 the second."""
     a = _joints(w[0])
     o = _joints(w[1])
     f: dict[str, float] = {}
 
     # Presence and confidence.
-    f["att_present"] = float(np.isfinite(a[:, L_HIP, 0]).mean())
-    f["opp_present"] = float(np.isfinite(o[:, L_HIP, 0]).mean())
-    f["att_mean_score"] = float(w[0][..., 2].mean())
-    f["opp_mean_score"] = float(w[1][..., 2].mean())
+    f["b0_present"] = float(np.isfinite(a[:, L_HIP, 0]).mean())
+    f["b1_present"] = float(np.isfinite(o[:, L_HIP, 0]).mean())
+    f["b0_mean_score"] = float(w[0][..., 2].mean())
+    f["b1_mean_score"] = float(w[1][..., 2].mean())
 
     # Whole-body movement of each boxer.
-    att_hip = _mid(a, L_HIP, R_HIP)
-    opp_hip = _mid(o, L_HIP, R_HIP)
-    f.update(_stats("att_hip_speed", _speed(att_hip)))
-    f.update(_stats("opp_hip_speed", _speed(opp_hip)))
-    f.update(_stats("opp_nose_speed", _speed(o[:, NOSE])))
-    f.update(_stats("hip_gap", np.linalg.norm(att_hip - opp_hip, axis=-1)))
+    b0_hip = _mid(a, L_HIP, R_HIP)
+    b1_hip = _mid(o, L_HIP, R_HIP)
+    f.update(_stats("b0_hip_speed", _speed(b0_hip)))
+    f.update(_stats("b1_hip_speed", _speed(b1_hip)))
+    f.update(_stats("b1_nose_speed", _speed(o[:, NOSE])))
+    f.update(_stats("hip_gap", np.linalg.norm(b0_hip - b1_hip, axis=-1)))
 
     # Torso orientation: shoulder line, hip line and lean.
-    att_sh = _mid(a, L_SHOULDER, R_SHOULDER)
-    att_sh_line = a[:, R_SHOULDER] - a[:, L_SHOULDER]
-    att_hip_line = a[:, R_HIP] - a[:, L_HIP]
-    f.update(_stats("att_shoulder_angle", np.degrees(np.arctan2(att_sh_line[:, 1], att_sh_line[:, 0]))))
-    f.update(_stats("att_hip_angle", np.degrees(np.arctan2(att_hip_line[:, 1], att_hip_line[:, 0]))))
-    lean = att_sh - att_hip
-    f.update(_stats("att_lean", np.degrees(np.arctan2(lean[:, 0], -lean[:, 1]))))
+    b0_sh = _mid(a, L_SHOULDER, R_SHOULDER)
+    b0_sh_line = a[:, R_SHOULDER] - a[:, L_SHOULDER]
+    b0_hip_line = a[:, R_HIP] - a[:, L_HIP]
+    f.update(_stats("b0_shoulder_angle", np.degrees(np.arctan2(b0_sh_line[:, 1], b0_sh_line[:, 0]))))
+    f.update(_stats("b0_hip_angle", np.degrees(np.arctan2(b0_hip_line[:, 1], b0_hip_line[:, 0]))))
+    lean = b0_sh - b0_hip
+    f.update(_stats("b0_lean", np.degrees(np.arctan2(lean[:, 0], -lean[:, 1]))))
     # Rotation between shoulders and hips, the twist that generates power.
-    twist = np.degrees(np.arctan2(att_sh_line[:, 1], att_sh_line[:, 0]) - np.arctan2(att_hip_line[:, 1], att_hip_line[:, 0]))
-    f.update(_stats("att_twist", twist))
+    twist = np.degrees(np.arctan2(b0_sh_line[:, 1], b0_sh_line[:, 0]) - np.arctan2(b0_hip_line[:, 1], b0_hip_line[:, 0]))
+    f.update(_stats("b0_twist", twist))
 
-    opp_nose = o[:, NOSE]
-    opp_sh = _mid(o, L_SHOULDER, R_SHOULDER)
-    opp_hips = opp_hip
+    b1_nose = o[:, NOSE]
+    b1_sh = _mid(o, L_SHOULDER, R_SHOULDER)
+    b1_hips = b1_hip
     per_hand = {}
     for side, wrist_i, shoulder_i, elbow_i in (("L", L_WRIST, L_SHOULDER, L_ELBOW), ("R", R_WRIST, R_SHOULDER, R_ELBOW)):
         wr = a[:, wrist_i]
@@ -126,10 +127,10 @@ def window_features(w: np.ndarray) -> dict[str, float]:
         speed = _speed(wr)
         extension = np.linalg.norm(wr - sh, axis=-1)
         elbow = _angle(sh, el, wr)
-        to_head = np.linalg.norm(wr - opp_nose, axis=-1)
-        to_shoulders = np.linalg.norm(wr - opp_sh, axis=-1)
-        to_hips = np.linalg.norm(wr - opp_hips, axis=-1)
-        closing = -np.diff(to_head, prepend=np.nan)  # positive when moving toward the opponent's head
+        to_head = np.linalg.norm(wr - b1_nose, axis=-1)
+        to_shoulders = np.linalg.norm(wr - b1_sh, axis=-1)
+        to_hips = np.linalg.norm(wr - b1_hips, axis=-1)
+        closing = -np.diff(to_head, prepend=np.nan)  # positive when moving toward the other boxer's head
 
         f.update(_stats(f"{side}_wrist_speed", speed))
         f.update(_stats(f"{side}_extension", extension))
@@ -154,10 +155,10 @@ def window_features(w: np.ndarray) -> dict[str, float]:
     rpk = _stats("", per_hand["R"]["speed"])["_peak_pos"]
     f["LR_speed_peak_diff"] = lpk - rpk
 
-    # Attacker's guard: how close the opponent's wrists get to the attacker's head.
+    # Guard of each boxer: how close the other boxer's wrists get to this boxer's head.
     for side, wrist_i in (("L", L_WRIST), ("R", R_WRIST)):
-        f.update(_stats(f"opp_{side}_to_att_head", np.linalg.norm(o[:, wrist_i] - a[:, NOSE], axis=-1)))
-    f.update(_stats("opp_wrist_speed", np.nanmax(np.stack([_speed(o[:, L_WRIST]), _speed(o[:, R_WRIST])]), axis=0)))
+        f.update(_stats(f"b1_{side}_to_att_head", np.linalg.norm(o[:, wrist_i] - a[:, NOSE], axis=-1)))
+    f.update(_stats("b1_wrist_speed", np.nanmax(np.stack([_speed(o[:, L_WRIST]), _speed(o[:, R_WRIST])]), axis=0)))
     return f
 
 

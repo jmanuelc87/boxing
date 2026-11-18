@@ -22,7 +22,7 @@ W, H, T = 128, 96, 16
 
 @pytest.fixture
 def data(tmp_path):
-    """Tiny pairs + clips folders with real JPEGs: train has 6 windows (one without an attacker), val 4."""
+    """Tiny pairs + clips folders with real JPEGs: train has 6 windows (one with no boxers), val 4."""
     pairs, src = tmp_path / "pairs", tmp_path / "seq"
     pairs.mkdir()
     rng = np.random.default_rng(0)
@@ -42,7 +42,7 @@ def data(tmp_path):
                 (src / rel).parent.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(src / rel), rng.integers(0, 255, (H, W, 3), dtype=np.uint8))
                 frames.append({"image": rel, "class_labels": [], "boxes": []})
-            quality = "no_attacker" if (split == "train" and i == 1) else "good"
+            quality = "no_boxers" if (split == "train" and i == 1) else "good"
             meta.append({"task": task, "track": i, "label": int(y[i]), "start": start, "quality": quality})
             records.append({"task": task, "track": i, "label": int(y[i]), "start": start, "width": W, "height": H, "frames": frames})
         for folder, rows in ((pairs, meta), (src, records)):
@@ -61,7 +61,7 @@ def test_item_shapes_and_keypoints_stay_inside_the_crop(data):
     assert 0.0 <= kp[..., :2].min() and kp[..., :2].max() <= 1.0
 
 
-def test_windows_without_an_attacker_are_dropped_and_limit_spreads_evenly(data):
+def test_windows_without_boxers_are_dropped_and_limit_spreads_evenly(data):
     pairs, src = data
     assert len(EPAMDataset(pairs, src, "train")) == 5
     assert len(EPAMDataset(pairs, src, "train", quality="good")) == 5
@@ -89,7 +89,7 @@ def test_mirror_swaps_hands_flips_x_and_is_an_involution():
     rng = np.random.default_rng(1)
     images = rng.integers(0, 255, (T, 8, 8, 3), dtype=np.uint8)
     kp = np.zeros((2, T, 17, 3), np.float32)
-    kp[0, :, 5] = [0.2, 0.4, 0.9]  # left shoulder of the attacker
+    kp[0, :, 5] = [0.2, 0.4, 0.9]  # left shoulder of the first boxer
     flipped_images, flipped = mirror(images, kp)
     np.testing.assert_allclose(flipped[0, :, 6], np.tile([0.8, 0.4, 0.9], (T, 1)))  # right shoulder, x mirrored
     assert not flipped[0, :, 5].any() and not flipped[1].any()  # missing joints stay at zero

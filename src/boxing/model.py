@@ -36,8 +36,8 @@ Differences from the reference
 The reference samples 48 pose frames and 16 RGB frames and picks every third pose feature to
 match. Here the pose and RGB streams see the same T frames by default, and the pose features are
 strided only when their frame count is a multiple of the RGB one. The reference tracks one
-person's 17 joints. Here the attacker's and opponent's joints are separate channels (34 in all),
-so the pose stream knows which boxer is which. The Gaussian width is not given in the paper text,
+person's 17 joints. Here the two boxers' joints are separate channels (34 in all),
+so the pose stream can tell them apart. Their order is by track id and carries no role. The Gaussian width is not given in the paper text,
 so ``sigma`` defaults to 0.6, the value PoseC3D uses at 56x56.
 """
 

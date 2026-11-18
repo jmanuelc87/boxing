@@ -41,7 +41,7 @@ def test_heatmap_peaks_at_the_keypoint_and_scales_with_score():
 def test_low_confidence_and_missing_joints_give_empty_maps():
     kp = _keypoints(batch=1, frames=2)
     kp[0, 0, 0, 3, 2] = 0.05  # below min_score
-    kp[0, 1, 1] = 0.0  # opponent absent on frame 1
+    kp[0, 1, 1] = 0.0  # second boxer absent on frame 1
     heat = keypoints_to_heatmaps(kp, size=56, min_score=0.1)
     assert heat[0, 3, 0].abs().sum() == 0
     assert heat[0, 17:, 1].abs().sum() == 0

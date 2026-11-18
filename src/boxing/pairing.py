@@ -22,7 +22,7 @@ overlap and nearest-centre matching swaps them.
     4. If a track is not matched on a frame, the nearest person to its last known position that is
        not the other boxer fills in.
 
-No role (attacker, opponent) is assigned and the labeled punch box is not used.
+No role is assigned, and the labeled punch box is not used.
 
 Outputs in ``--dst``:
     train.npz, val.npz    X (float32) and y (int64, class id)

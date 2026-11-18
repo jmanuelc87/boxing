@@ -1,13 +1,14 @@
 """Dataset for the paired keypoint windows written by ``boxing.pairing``.
 
-Each item is ``(x, y)`` with ``x`` of shape ``(2, T, 17, 3)``: row 0 is the
-attacker, row 1 the opponent, and the last axis is ``(x, y, score)``.
+Each item is ``(x, y)`` with ``x`` of shape ``(2, T, 17, 3)``: row 0 is the first boxer and
+row 1 the second (ordered by DeepSORT track id, so the order carries no role), and the last
+axis is ``(x, y, score)``.
 
 Coordinates are normalised per window so the model sees body-relative motion
 rather than camera position or zoom:
 
-* origin: the attacker's mean hip centre over the window,
-* scale: the attacker's mean torso length (shoulder centre to hip centre).
+* origin: the first boxer's mean hip centre over the window,
+* scale: the first boxer's mean torso length (shoulder centre to hip centre).
 
 Both boxers share the same transform, so their relative position is kept.
 Joints with score 0 (people missing from a frame) stay at (0, 0, 0).
@@ -49,20 +50,20 @@ def load_names(root: Path) -> list[str]:
 
 def normalize_window(w: np.ndarray) -> np.ndarray:
     """Pixel window ``(2, T, 17, 3)`` -> body-relative window of the same shape."""
-    att = w[0]
-    score = att[..., 2]
+    first = w[0]
+    score = first[..., 2]
 
     hips_ok = (score[:, L_HIP] > VALID_CONF) & (score[:, R_HIP] > VALID_CONF)
-    hip_mid = (att[:, L_HIP, :2] + att[:, R_HIP, :2]) / 2
+    hip_mid = (first[:, L_HIP, :2] + first[:, R_HIP, :2]) / 2
     if hips_ok.any():
         center = hip_mid[hips_ok].mean(axis=0)
     else:
         visible = score > VALID_CONF
-        center = att[..., :2][visible].mean(axis=0) if visible.any() else np.zeros(2, dtype=np.float32)
+        center = first[..., :2][visible].mean(axis=0) if visible.any() else np.zeros(2, dtype=np.float32)
 
     torso_ok = hips_ok & (score[:, L_SHOULDER] > VALID_CONF) & (score[:, R_SHOULDER] > VALID_CONF)
     if torso_ok.any():
-        shoulder_mid = (att[:, L_SHOULDER, :2] + att[:, R_SHOULDER, :2]) / 2
+        shoulder_mid = (first[:, L_SHOULDER, :2] + first[:, R_SHOULDER, :2]) / 2
         torso = float(np.linalg.norm(shoulder_mid[torso_ok] - hip_mid[torso_ok], axis=-1).mean())
     else:
         torso = DEFAULT_TORSO_PX
@@ -93,8 +94,8 @@ def augment_window(x: np.ndarray, rng: np.random.Generator, flip: bool = True) -
 class PunchPairDataset(Dataset):
     """One item per window: ``(x[2, T, 17, 3] float32, y int64)``.
 
-    ``quality="all"`` keeps every window that has an attacker; ``"good"`` keeps only
-    windows with the attacker and opponent on every frame.
+    ``quality="all"`` keeps every window with at least one boxer tracked; ``"good"`` keeps only
+    windows with both boxers on every frame.
     """
 
     def __init__(

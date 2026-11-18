@@ -6,7 +6,7 @@ Each item is ``(images, keypoints, label)``:
     keypoints  (2, T, 17, 3)    float32, (x, y, score) with x and y in [0, 1] of the same crop
     label      int64
 
-Row 0 of ``keypoints`` is the attacker and row 1 the opponent. The crop is the square bounding box
+Row 0 of ``keypoints`` is the first boxer and row 1 the second (by DeepSORT track id). The crop is the square bounding box
 of all confident keypoints of both boxers over the window, padded, so the gloves stay large in
 the 224x224 frame. Images and keypoints share one crop, which is what the pose heatmaps need to
 line up with the RGB features.
@@ -85,8 +85,8 @@ def mirror(images: np.ndarray, kp: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 class EPAMDataset(Dataset):
     """One item per paired window: RGB frames and keypoints in one shared crop.
 
-    ``quality="all"`` keeps every window that has an attacker; ``"good"`` keeps only windows
-    with the attacker and opponent on every frame. ``limit`` keeps that many windows, spread
+    ``quality="all"`` keeps every window with at least one boxer tracked; ``"good"`` keeps only
+    windows with both boxers on every frame. ``limit`` keeps that many windows, spread
     evenly across the split (used by the smoke-test mode).
     """
 

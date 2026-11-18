@@ -33,12 +33,11 @@ stable identity) and ``attacker_method`` now counts ``track`` and ``nearest`` (f
 Usage:
     python -m boxing.pairing --src data/processed/punch-seq \\
         --keypoints data/processed/punch-keypoints-boxers/images \\
-        --dst data/processed/punch-pairs [--embedder mobilenet] [--workers N]
+        --dst data/processed/punch-pairs [--workers N]
 
 ``--workers N`` pairs clips in N processes (``0`` = every core); each process loads its own
-embedder, so on a GPU keep N small. The default ``torchreid`` embedder (OSNet, a person Re-ID
-model) needs ``torchreid`` installed; ``--embedder mobilenet`` uses the generic embedder that
-ships with ``deep-sort-realtime`` and needs nothing extra.
+embedder, so on a GPU keep N small. The Re-ID embedder is the MobileNetV2 that ships with
+``deep-sort-realtime``, so no extra dependency is needed.
 """
 
 from __future__ import annotations
@@ -63,7 +62,6 @@ log = logging.getLogger("boxing.pairing")
 
 NUM_KEYPOINTS = 17
 SPLITS = ("train", "val")
-EMBEDDERS = ("mobilenet", "torchreid")
 MIN_CROP = 2  # pixels; smaller crops cannot be embedded
 
 
@@ -71,7 +69,6 @@ MIN_CROP = 2  # pixels; smaller crops cannot be embedded
 class TrackConfig:
     """DeepSORT and Re-ID settings (picklable, so it can go to worker processes)."""
 
-    embedder: str = "torchreid"
     cpu: bool = False
     max_age: int = 16  # frames a track may go unseen; a whole window, so a boxer can be hidden and come back
     n_init: int = 2  # hits before a track is confirmed
@@ -85,19 +82,16 @@ class TrackConfig:
 # --------------------------------------------------------------------------------------
 
 _EMBEDDER = None
-_EMBEDDER_KEY: tuple | None = None
+_EMBEDDER_KEY: bool | None = None
 
 
 def _get_embedder(cfg: TrackConfig):
     global _EMBEDDER, _EMBEDDER_KEY
-    key = (cfg.embedder, cfg.cpu)
+    key = cfg.cpu
     if _EMBEDDER is None or _EMBEDDER_KEY != key:
         from deep_sort_realtime.embedder import embedder_pytorch
 
-        if cfg.embedder == "torchreid":
-            _EMBEDDER = embedder_pytorch.TorchReID_Embedder(bgr=True, gpu=not cfg.cpu)
-        else:
-            _EMBEDDER = embedder_pytorch.MobileNetv2_Embedder(half=True, bgr=True, gpu=not cfg.cpu)
+        _EMBEDDER = embedder_pytorch.MobileNetv2_Embedder(half=True, bgr=True, gpu=not cfg.cpu)
         _EMBEDDER_KEY = key
         _frame_embeddings.cache_clear()
     return _EMBEDDER
@@ -390,7 +384,6 @@ def main() -> None:
     parser.add_argument("--dst", type=Path, default=Path("data/processed/punch-pairs"), help="output directory (created if missing)")
     parser.add_argument("--splits", nargs="+", default=list(SPLITS), choices=SPLITS)
     parser.add_argument("--workers", type=int, default=1, help="processes pairing clips in parallel; 0 = all cores (default 1)")
-    parser.add_argument("--embedder", choices=EMBEDDERS, default="torchreid", help="Re-ID appearance model (default torchreid, OSNet)")
     parser.add_argument("--cpu", action="store_true", help="run the embedder on the CPU even if an accelerator is available")
     parser.add_argument("--max-age", type=int, default=TrackConfig.max_age, help="frames a track may go unseen before it is dropped")
     parser.add_argument("--n-init", type=int, default=TrackConfig.n_init, help="hits before a track is confirmed")
@@ -405,7 +398,6 @@ def main() -> None:
         parser.error(f"--keypoints is not a directory: {args.keypoints}")
 
     cfg = TrackConfig(
-        embedder=args.embedder,
         cpu=args.cpu,
         max_age=args.max_age,
         n_init=args.n_init,

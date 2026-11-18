@@ -3,7 +3,7 @@
 The model is an RF-DETR keypoint detector published as ONNX, so it runs through
 ONNX Runtime rather than ``transformers``.
 
-    python -m boxing.keypoints SRC DST [--threshold 0.5] [--role-model PATH] [--all-people] [--color-rules] [--workers N]
+    python -m boxing.keypoints SRC DST [--threshold 0.5] [--role-model PATH] [--all-people] [--color-rules] [--workers N] [--batch-size B]
 
 By default each person is classified by the trained role model (``role_model.pt`` from
 ``boxing.train_role_classifier``, default ``data/processed/role-classifier/role_model.pt``) and
@@ -22,6 +22,8 @@ SRC is an image, a directory of images, a dataset root, or a video:
 
 Each record lists the detected people. A person has a pixel box ``[x1, y1, x2, y2]``,
 a detection ``score``, and 17 keypoints ``{"name", "x", "y", "score"}`` in COCO order.
+
+``--batch-size B`` (directory and dataset sources) sends B images through the model per forward pass.
 
 ``--workers N`` (directory and dataset sources only) runs N worker processes, each with its own copy of the
 model; ``0`` uses every core. It pays off on the CPU; on a single GPU (MPS/CUDA) the workers share the device
@@ -43,7 +45,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
@@ -94,16 +95,17 @@ def decode(
     width: int,
     height: int,
     threshold: float = 0.5,
+    index: int = 0,
 ) -> list[Person]:
-    """Turn the raw ``pred_*`` tensors of one image into people in pixel coordinates.
+    """Turn the raw ``pred_*`` tensors of image ``index`` in the batch into people in pixel coordinates.
 
-    ``outputs`` holds a batch of one: ``pred_boxes`` (1, Q, 4) normalised cxcywh,
-    ``pred_logits`` (1, Q, C+1) with the background as the last slot, and
-    ``pred_keypoints`` (1, Q, R, 8) with R >= len(names).
+    ``outputs`` holds a batch of B: ``pred_boxes`` (B, Q, 4) normalised cxcywh,
+    ``pred_logits`` (B, Q, C+1) with the background as the last slot, and
+    ``pred_keypoints`` (B, Q, R, 8) with R >= len(names).
     """
-    boxes = outputs["pred_boxes"][0]
-    logits = outputs["pred_logits"][0]
-    keypoints = outputs["pred_keypoints"][0]
+    boxes = outputs["pred_boxes"][index]
+    logits = outputs["pred_logits"][index]
+    keypoints = outputs["pred_keypoints"][index]
 
     # RF-DETR uses per-class sigmoid, not softmax. The last slot is background.
     scores = sigmoid(logits[:, :-1]).max(axis=1)
@@ -161,11 +163,16 @@ class PoseEstimator:
         self.boxers_only = boxers_only
         self.role_model = role_model
 
+        import onnxruntime as ort  # lazy: the YOLO backend does not need it
+
         available = ort.get_available_providers()
         if providers is None:
             providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
         self.session = ort.InferenceSession(str(onnx_path), providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
+        inp = self.session.get_inputs()[0]
+        self.input_name = inp.name
+        # A fixed batch dimension (an int, not a symbolic name or None) caps the batch size the model accepts.
+        self.max_batch: int | None = inp.shape[0] if isinstance(inp.shape[0], int) else None
 
     @classmethod
     def from_hub(cls, threshold: float = 0.5, boxers_only: bool = False, role_model=None) -> PoseEstimator:
@@ -178,18 +185,28 @@ class PoseEstimator:
         )
 
     def preprocess(self, image_bgr: np.ndarray) -> np.ndarray:
-        """BGR image -> NCHW float32 batch of one. The frame is stretched to the input size."""
+        """BGR image -> CHW float32. The frame is stretched to the input size."""
         resized = cv2.resize(image_bgr, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        x = (rgb - MEAN) / STD
-        return np.ascontiguousarray(x.transpose(2, 0, 1)[None])
+        return np.ascontiguousarray(((rgb - MEAN) / STD).transpose(2, 0, 1))
+
+    def predict_batch(self, images: list[np.ndarray]) -> list[list[Person]]:
+        """One forward pass per chunk of images; images may differ in size (each is resized to the input)."""
+        results: list[list[Person]] = []
+        step = min(len(images), self.max_batch or len(images)) or 1
+        for start in range(0, len(images), step):
+            chunk = images[start : start + step]
+            batch = np.stack([self.preprocess(im) for im in chunk])
+            raw = self.session.run(None, {self.input_name: batch})
+            outputs = {o.name: r for o, r in zip(self.session.get_outputs(), raw)}
+            for i, im in enumerate(chunk):
+                h, w = im.shape[:2]
+                people = decode(outputs, self.names, w, h, self.threshold, index=i)
+                results.append(keep_boxers(im, people, self.role_model) if self.boxers_only else people)
+        return results
 
     def predict(self, image_bgr: np.ndarray) -> list[Person]:
-        height, width = image_bgr.shape[:2]
-        raw = self.session.run(None, {self.input_name: self.preprocess(image_bgr)})
-        outputs = {o.name: r for o, r in zip(self.session.get_outputs(), raw)}
-        people = decode(outputs, self.names, width, height, self.threshold)
-        return keep_boxers(image_bgr, people, self.role_model) if self.boxers_only else people
+        return self.predict_batch([image_bgr])[0]
 
 
 COCO_NAMES = [
@@ -225,8 +242,20 @@ class YoloPoseEstimator:
         self.boxers_only = boxers_only
         self.role_model = role_model
 
+    def predict_batch(self, images: list[np.ndarray]) -> list[list[Person]]:
+        """Ultralytics letterboxes and stacks a list of frames into one forward pass."""
+        results = self.model.predict(images, device=self.device, conf=self.threshold, verbose=False)
+        out = []
+        for im, result in zip(images, results):
+            people = self._people(result)
+            out.append(keep_boxers(im, people, self.role_model) if self.boxers_only else people)
+        return out
+
     def predict(self, image_bgr: np.ndarray) -> list[Person]:
-        result = self.model.predict(image_bgr, device=self.device, conf=self.threshold, verbose=False)[0]
+        return self.predict_batch([image_bgr])[0]
+
+    @staticmethod
+    def _people(result) -> list[Person]:
         people: list[Person] = []
         if result.boxes is None or len(result.boxes) == 0:
             return people
@@ -242,8 +271,7 @@ class YoloPoseEstimator:
                 for name, (x, y), c in zip(COCO_NAMES, pts, conf)
             ]
             people.append(Person(box=[float(v) for v in box], score=float(score), keypoints=joints))
-
-        return keep_boxers(image_bgr, people, self.role_model) if self.boxers_only else people
+        return people
 
 
 def record(people: list[Person], width: int, height: int) -> dict:
@@ -264,6 +292,15 @@ def run_image(estimator: PoseEstimator, src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     h, w = image.shape[:2]
     dst.write_text(json.dumps(record(estimator.predict(image), w, h), indent=2), encoding="utf-8")
+
+
+def run_batch(estimator: PoseEstimator | YoloPoseEstimator, jobs: list[tuple[Path, Path]]) -> None:
+    """Predict ``jobs`` (source, destination) in one batched call and write one ``.json`` per image."""
+    images = [_read_image(src) for src, _ in jobs]
+    for (_, dst), image, people in zip(jobs, images, estimator.predict_batch(images)):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        h, w = image.shape[:2]
+        dst.write_text(json.dumps(record(people, w, h), indent=2), encoding="utf-8")
 
 
 def is_dataset(root: Path) -> bool:
@@ -299,10 +336,10 @@ def _init_worker(spec: dict) -> None:
     _WORKER_ESTIMATOR = build_estimator(**spec)
 
 
-def _worker_image(job: tuple[Path, Path]) -> None:
-    src, dst = job
+def _worker_batch(jobs: list[tuple[Path, Path]]) -> int:
     try:
-        run_image(_WORKER_ESTIMATOR, src, dst)
+        run_batch(_WORKER_ESTIMATOR, jobs)
+        return len(jobs)
     except SystemExit as exc:  # SystemExit would kill the worker instead of reporting the error
         raise RuntimeError(str(exc)) from None
 
@@ -313,6 +350,7 @@ def run_directory(
     dst: Path,
     workers: int = 1,
     spec: dict | None = None,
+    batch_size: int = 1,
 ) -> None:
     if is_dataset(src):
         images = [src / rel for rel in dataset_images(src)]
@@ -324,6 +362,7 @@ def run_directory(
     if not images:
         raise SystemExit(f"no images found under {src}")
     jobs = [(path, (dst / path.relative_to(src)).with_suffix(".json")) for path in images]
+    batches = [jobs[i : i + batch_size] for i in range(0, len(jobs), batch_size)]
     n_workers = (os.cpu_count() or 1) if workers == 0 else max(1, workers)
     if n_workers > 1 and spec is not None and len(jobs) > 1:
         # spawn, not fork: forking after torch/CUDA/ONNX Runtime has started threads is unsafe
@@ -331,11 +370,14 @@ def run_directory(
         with ProcessPoolExecutor(
             max_workers=n_workers, mp_context=ctx, initializer=_init_worker, initargs=(spec,)
         ) as pool:
-            for _ in tqdm(pool.map(_worker_image, jobs, chunksize=8), total=len(jobs), unit="img"):
-                pass
+            with tqdm(total=len(jobs), unit="img") as bar:
+                for n in pool.map(_worker_batch, batches):
+                    bar.update(n)
     else:
-        for path, out in tqdm(jobs, unit="img"):
-            run_image(estimator, path, out)
+        with tqdm(total=len(jobs), unit="img") as bar:
+            for chunk in batches:
+                run_batch(estimator, chunk)
+                bar.update(len(chunk))
 
 
 def run_video(estimator: PoseEstimator, src: Path, dst: Path) -> None:
@@ -389,9 +431,10 @@ def run(
     estimator: PoseEstimator | YoloPoseEstimator | None,
     workers: int = 1,
     spec: dict | None = None,
+    batch_size: int = 1,
 ) -> None:
     if src.is_dir():
-        run_directory(estimator, src, dst, workers, spec)
+        run_directory(estimator, src, dst, workers, spec, batch_size)
     elif src.suffix.lower() in IMAGE_SUFFIXES:
         run_image(estimator, src, dst)
     elif src.suffix.lower() in VIDEO_SUFFIXES:
@@ -430,6 +473,12 @@ def main(argv: list[str] | None = None) -> None:
         help="worker processes for directory/dataset sources, each with its own model; 0 = all cores (default 1)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="images per forward pass for directory/dataset sources (default 8; 1 = one by one)",
+    )
+    parser.add_argument(
         "--color-rules",
         action="store_true",
         help="filter by torso colour rules instead of the role model",
@@ -462,7 +511,7 @@ def main(argv: list[str] | None = None) -> None:
     parallel = args.workers != 1 and args.src.is_dir()
     # Parallel workers each build their own estimator, so the parent skips loading one.
     estimator = None if parallel else build_estimator(**spec)
-    run(args.src, args.dst, estimator, args.workers, spec if parallel else None)
+    run(args.src, args.dst, estimator, args.workers, spec if parallel else None, max(1, args.batch_size))
 
 
 if __name__ == "__main__":

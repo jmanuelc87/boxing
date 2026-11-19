@@ -222,8 +222,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Data
-data/
+# Data (only data/processed/role-classifier is tracked)
+data/*
+!data/processed/
+data/processed/*
+!data/processed/role-classifier/
 outputs/
 runs/
 # Weights & Biases local run files

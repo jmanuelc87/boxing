@@ -9,7 +9,25 @@ Pose-driven, attention-guided two-stream network for punch recognition, implemen
 | `images` | `(B, T, 3, H, W)` | normalised RGB frames, e.g. T=16, 224x224 |
 | `keypoints` | `(B, 2, T, 17, 3)` | `(x, y, score)`, x/y in [0, 1] of the crop; 2 boxers, 17 joints |
 
-**Outputs**: `EPAMOutput(rgb_logits, pose_logits)`, each `(B, num_classes)`. At inference the two softmax scores are fused with `rgb_weight`.
+**Outputs**: `EPAMOutput(rgb_logits, pose_logits)`, each `(B, num_classes)`. At inference `EPAMOutput.probabilities(rgb_weight)` fuses the two softmax scores.
+
+`EPAMNet` is a Hugging Face `PreTrainedModel` and `EPAMNetConfig` a `PreTrainedConfig` (`model_type = "epam-net"`), so `save_pretrained`, `from_pretrained` and `push_to_hub` work. The module imports nothing from `boxing` and is registered for the auto classes (`AutoModel`), so it can be loaded from the Hub with `trust_remote_code=True`.
+
+## Configuration
+
+`EPAMNetConfig` fields and defaults:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `num_classes` | 8 | punch classes (names go in `id2label`) |
+| `heatmap_size` | 56 | side of the pose heatmaps; 56 pairs with 224x224 RGB, both ending at 7x7 |
+| `sigma` | 0.6 | Gaussian radius, one value or a list of 17 |
+| `min_score` | 0.1 | joints at or below this confidence give an empty heatmap |
+| `rgb_blocks` / `pose_blocks` | (3, 5, 11, 7) / (5, 11, 7) | blocks per stage |
+| `rgb_channels` / `pose_channels` | (24, 48, 96, 192) / (24, 48, 96) | output width per stage |
+| `dropout` | 0.5 | dropout before each classifier |
+| `rgb_shift_div` / `pose_shift_div` | 8 / 4 | temporal shift divisors |
+| `rgb_weight` | 0.5 | RGB weight in late fusion |
 
 ## Overview
 
@@ -47,9 +65,9 @@ flowchart TD
 
 ## Pose heatmaps
 
-`keypoints_to_heatmaps` renders each joint as a Gaussian at its `(x, y)` position on a 56x56 grid, scaled by its confidence. Joints with a score at or below `min_score` (0.1) give an empty map. The channels are ordered boxer 0's 17 joints, then boxer 1's.
+`keypoints_to_heatmaps` renders each joint as a Gaussian at its `(x, y)` position on a 56x56 grid, scaled by its confidence. Joints with a score at or below `min_score` (0.1) give an empty map. The channels are ordered boxer 0's 17 joints, then boxer 1's. The two boxers' order is by track id and carries no role.
 
-`sigma` (the Gaussian radius, in heatmap pixels) is either one value for every joint (default 0.6) or a list of 17, one per COCO joint, so each keypoint can have its own radius. A list must have 17 positive values. Set it with `EPAMNetConfig(sigma=...)` or `--sigma` on the training script.
+`sigma` (the Gaussian radius, in heatmap pixels) is either one value for every joint (default 0.6) or a list of 17, one per COCO joint, so each keypoint can have its own radius. A list must have 17 positive values (otherwise `ValueError`). Set it with `EPAMNetConfig(sigma=...)` or `--sigma` on the training script.
 
 ## X-ShiftNet backbone
 
@@ -86,6 +104,10 @@ flowchart LR
     ADD --> RE["ReLU"]
 ```
 
+### Frame and space alignment
+
+`_align_pose` makes the pose features match the RGB features before attention. If the frame counts differ, the pose frames are strided (`[:, :, ::T_pose // T_rgb]`); `T_pose` must be a multiple of `T_rgb`, otherwise `ValueError`. If the spatial sizes differ, the pose features are adaptively average-pooled to the RGB size. By default both streams see the same T frames, so no striding happens. The reference code samples 48 pose frames against 16 RGB frames.
+
 ## Pose-guided attention
 
 Computed from the pose features and used to re-weight the RGB features. The output lies in [0, 1].
@@ -108,7 +130,7 @@ flowchart TD
 
 ## Classifier head
 
-Each stream has its own head: `Dropout(0.5)`, global average pool over (T, H, W), and one `Linear` layer to `num_classes`.
+Each stream has its own head: `Dropout(config.dropout)` (0.5 by default), global average pool over (T, H, W), and one `Linear` layer to `num_classes`.
 
 ```mermaid
 flowchart LR
@@ -117,7 +139,11 @@ flowchart LR
 
 ## Temporal shift
 
-`TemporalShift` moves the first `C // div` channels to the next frame (`out[t] = x[t + 1]`) and the next `C // div` channels to the previous frame (`out[t] = x[t - 1]`). Frames shifted past either end are zero-filled, and the rest of the channels are untouched. It has no parameters. The divisor is `rgb_shift_div` (8) for the RGB stream and `pose_shift_div` (4) for the pose stream, the values the official code uses.
+`TemporalShift` moves the first `C // div` channels to the next frame (`out[t] = x[t + 1]`) and the next `C // div` channels to the previous frame (`out[t] = x[t - 1]`). Frames shifted past either end are zero-filled, and the rest of the channels are untouched. It has no parameters. It returns the input unchanged when `C // div` is 0 or there is a single frame. The divisor is `rgb_shift_div` (8) for the RGB stream and `pose_shift_div` (4) for the pose stream, the values the official code uses.
+
+## Weight initialisation
+
+`_init_weights` uses Kaiming normal (`fan_out`, ReLU) for `Conv3d` and `Conv1d` weights, ones and zeros for `BatchNorm3d`, and `N(0, 0.01)` weights with zero bias for `Linear`.
 
 ## Pretrained backbones
 

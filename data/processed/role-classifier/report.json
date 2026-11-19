@@ -1,0 +1,183 @@
+{
+  "seed": 0,
+  "holdout": "task_kam4_gh199681",
+  "roles": [
+    "boxer_red",
+    "boxer_blue",
+    "referee",
+    "other"
+  ],
+  "results": {
+    "frozen ResNet-18 embeddings": {
+      "accuracy": 0.8095238095238095,
+      "macro_f1": 0.7486772486772486,
+      "n": 63,
+      "confusion": [
+        [
+          10,
+          5,
+          0,
+          0
+        ],
+        [
+          2,
+          7,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          5,
+          3
+        ],
+        [
+          0,
+          0,
+          2,
+          29
+        ]
+      ],
+      "per_class": {
+        "boxer_red": {
+          "precision": 0.8333333333333334,
+          "recall": 0.6666666666666666,
+          "f1": 0.7407407407407408,
+          "support": 15
+        },
+        "boxer_blue": {
+          "precision": 0.5833333333333334,
+          "recall": 0.7777777777777778,
+          "f1": 0.6666666666666666,
+          "support": 9
+        },
+        "referee": {
+          "precision": 0.7142857142857143,
+          "recall": 0.625,
+          "f1": 0.6666666666666666,
+          "support": 8
+        },
+        "other": {
+          "precision": 0.90625,
+          "recall": 0.9354838709677419,
+          "f1": 0.9206349206349206,
+          "support": 31
+        }
+      }
+    },
+    "fine-tuned efficientnet_b3": {
+      "accuracy": 0.9523809523809523,
+      "macro_f1": 0.9421103044968744,
+      "n": 63,
+      "confusion": [
+        [
+          14,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          9,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          8,
+          0
+        ],
+        [
+          0,
+          0,
+          2,
+          29
+        ]
+      ],
+      "per_class": {
+        "boxer_red": {
+          "precision": 1.0,
+          "recall": 0.9333333333333333,
+          "f1": 0.9655172413793104,
+          "support": 15
+        },
+        "boxer_blue": {
+          "precision": 0.9,
+          "recall": 1.0,
+          "f1": 0.9473684210526316,
+          "support": 9
+        },
+        "referee": {
+          "precision": 0.8,
+          "recall": 1.0,
+          "f1": 0.888888888888889,
+          "support": 8
+        },
+        "other": {
+          "precision": 1.0,
+          "recall": 0.9354838709677419,
+          "f1": 0.9666666666666666,
+          "support": 31
+        }
+      }
+    },
+    "colour rules": {
+      "accuracy": 0.8253968253968254,
+      "macro_f1": 0.7226228632478633,
+      "n": 63,
+      "confusion": [
+        [
+          15,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          9,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          7
+        ],
+        [
+          2,
+          2,
+          0,
+          27
+        ]
+      ],
+      "per_class": {
+        "boxer_red": {
+          "precision": 0.8823529411764706,
+          "recall": 1.0,
+          "f1": 0.9375,
+          "support": 15
+        },
+        "boxer_blue": {
+          "precision": 0.8181818181818182,
+          "recall": 1.0,
+          "f1": 0.9,
+          "support": 9
+        },
+        "referee": {
+          "precision": 1.0,
+          "recall": 0.125,
+          "f1": 0.2222222222222222,
+          "support": 8
+        },
+        "other": {
+          "precision": 0.7941176470588235,
+          "recall": 0.8709677419354839,
+          "f1": 0.8307692307692308,
+          "support": 31
+        }
+      }
+    }
+  }
+}

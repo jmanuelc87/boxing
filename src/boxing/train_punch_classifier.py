@@ -5,10 +5,13 @@
 
 Both streams are trained at once with a classification loss on each head (the attended RGB head
 and the pose head), summed. Predictions fuse the two streams' softmax scores. The optimiser is AdamW
-(decoupled weight decay) with a cosine schedule with warm-up. The reference implementation uses SGD.
+(decoupled weight decay) with a cosine schedule with warm-up. The two pretrained backbones train at a lower
+peak learning rate (``--backbone-lr``) than the heads and the attention block (``--lr``). The reference
+implementation uses SGD.
 
 Train and validation are separate fights, so the score reflects unseen fights. The checkpoint with
-the best validation accuracy of the fused prediction is kept.
+the best validation macro F1 of the fused prediction is kept, since accuracy alone is dominated by
+the common "Jab a la cabeza" class.
 
 The best model is saved with ``save_pretrained`` (``best/``: ``model.safetensors``, ``config.json``,
 the model code and a model card) and, unless ``--no-push``, uploaded to the Hugging Face Hub repo
@@ -30,7 +33,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import subprocess
 import time
 from pathlib import Path
 
@@ -56,6 +61,37 @@ TEST_VAL_WINDOWS = 16
 TEST_WORKERS = 2
 HUB_REPO = "jmanuelc87/boxing-punch-epam-net"
 MODEL_OVERRIDES: dict = {}  # extra EPAMNetConfig fields; the tests shrink the network with this
+
+
+def boxing_commit() -> str | None:
+    """Commit hash of the boxing code in use.
+
+    Order: ``BOXING_COMMIT`` (set by the notebook), the git checkout the module is imported from, then the
+    commit pip recorded when installing from a git URL. ``None`` when none of them is available.
+    """
+    if os.environ.get("BOXING_COMMIT"):
+        return os.environ["BOXING_COMMIT"]
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        if head:
+            dirty = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            return head + ("-dirty" if dirty else "")
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    try:
+        from importlib.metadata import distribution
+
+        direct = distribution("boxing").read_text("direct_url.json")
+        if direct:
+            return json.loads(direct).get("vcs_info", {}).get("commit_id")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def load_names(root: Path) -> list[str]:
@@ -102,6 +138,17 @@ def score(y: np.ndarray, pred: np.ndarray, n_classes: int) -> dict:
         "macro_f1": float(m["f1"].mean()),
         **m,
     }
+
+
+def wandb_confusion_matrix(cm: np.ndarray, names: list[str]):
+    """Interactive wandb confusion-matrix chart built from a count matrix (rows = true, columns = predicted)."""
+    true_idx, pred_idx = np.nonzero(cm)
+    counts = cm[true_idx, pred_idx]
+    return wandb.plot.confusion_matrix(
+        y_true=np.repeat(true_idx, counts).tolist(),
+        preds=np.repeat(pred_idx, counts).tolist(),
+        class_names=names,
+    )
 
 
 def print_report(result: dict, names: list[str]) -> None:
@@ -185,9 +232,9 @@ first if you do not trust the source.
 
 ## Validation results
 
-The best epoch ({best_epoch}) by fused accuracy on the validation split. Train and validation are
-separate fights, so these scores are on fights the model did not see. Macro F1 is shown beside
-accuracy because accuracy alone is dominated by the most common class.
+The best epoch ({best_epoch}) by fused macro F1 on the validation split. Train and validation are
+separate fights, so these scores are on fights the model did not see. Accuracy alone is dominated by
+the most common class, so the macro F1 is the number to watch.
 
 | | accuracy | macro precision | macro recall | macro F1 |
 |---|---|---|---|---|
@@ -201,9 +248,12 @@ accuracy because accuracy alone is dominated by the most common class.
 
 ## Training
 
-AdamW (weight decay {args.weight_decay}), peak learning rate {args.lr} with a
-{args.warmup_epochs:g}-epoch warm-up then cosine decay, batch size {args.batch_size},
+AdamW (weight decay {args.weight_decay}), with a
+{args.warmup_epochs:g}-epoch warm-up then cosine decay (peak {args.lr} for the heads and attention, {args.backbone_lr} for the
+backbones), batch size {args.batch_size},
 {args.loss} loss (label smoothing {args.label_smoothing}), inverse-square-root class weights,
+effective batch {args.batch_size * args.accum_steps} ({args.batch_size} clips x {args.accum_steps} accumulated batches),
+BatchNorm statistics {"frozen" if args.freeze_bn else "updated"},
 seed {args.seed}. Windows quality filter: `{args.quality}`.
 
 ## Limitations
@@ -226,34 +276,50 @@ def push_folder(api: HfApi | None, repo: str, folder: Path, path_in_repo: str, m
 
 def train_epoch(
     model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int, log_every: int = 0,
-    grad_clip: float = 5.0,
+    grad_clip: float = 5.0, accum_steps: int = 1, freeze_bn: bool = False,
 ) -> tuple[float, dict[str, float]]:
-    """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many steps.
+    """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many optimiser steps.
+
+    The optimiser steps every ``accum_steps`` batches (gradients are averaged over them), so the effective batch is
+    ``accum_steps`` times the loader's batch size. With ``freeze_bn``, BatchNorm layers keep their running statistics
+    fixed (eval mode) while their affine parameters still train.
 
     Returns the mean loss and the gradient-norm statistics: the norm before clipping at ``grad_clip``,
-    its mean and max over the epoch, and the share of steps that were clipped.
+    its mean and max over the optimiser steps, and the share of steps that were clipped.
     """
     model.train()
+    if freeze_bn:
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm3d):
+                m.eval()
     total, seen = 0.0, 0
     norms = []
+    n_batches = len(loader)
+    optimizer.zero_grad()
     bar = tqdm(loader, desc=f"epoch {epoch}/{epochs}", leave=False)
-    for images, keypoints, y in bar:
+    for i, (images, keypoints, y) in enumerate(bar, start=1):
         images, keypoints, y = images.to(device), keypoints.to(device), y.to(device)
         out = model(images, keypoints)
         loss = criterion(out.rgb_logits, y) + criterion(out.pose_logits, y)
-        optimizer.zero_grad()
-        loss.backward()
-        norms.append(float(nn.utils.clip_grad_norm_(model.parameters(), grad_clip)))  # returns the norm before clipping
-        optimizer.step()
-        scheduler.step()
+        (loss / accum_steps).backward()
         total += loss.item() * len(y)
         seen += len(y)
+        if i % accum_steps == 0 or i == n_batches:  # the last, possibly partial, group also steps
+            norms.append(float(nn.utils.clip_grad_norm_(model.parameters(), grad_clip)))  # returns the norm before clipping
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            if log_every and wandb.run is not None and scheduler.last_epoch % log_every == 0:
+                wandb.log(
+                    {
+                        "step/loss": loss.item(),
+                        "step/lr": optimizer.param_groups[0]["lr"],
+                        "step/lr_backbone": optimizer.param_groups[1]["lr"],
+                        "epoch": epoch,
+                    },
+                    step=scheduler.last_epoch,
+                )
         bar.set_postfix(loss=f"{total / seen:.3f}")
-        if log_every and wandb.run is not None and scheduler.last_epoch % log_every == 0:
-            wandb.log(
-                {"step/loss": loss.item(), "step/lr": optimizer.param_groups[0]["lr"], "epoch": epoch},
-                step=scheduler.last_epoch,
-            )
     grad = {
         "grad_norm_mean": float(np.mean(norms)) if norms else 0.0,
         "grad_norm_max": float(np.max(norms)) if norms else 0.0,
@@ -268,22 +334,27 @@ def main() -> None:
     parser.add_argument("--src", type=Path, default=Path("data/processed/punch-seq"), help="clips and frames from boxing.preprocess")
     parser.add_argument("--out", type=Path, default=None, help="default: runs/epam-net, or runs/epam-test with --test")
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3, help="peak AdamW learning rate")
+    parser.add_argument("--batch-size", type=int, default=16, help="clips per forward pass; BatchNorm statistics are computed over these")
+    parser.add_argument("--accum-steps", type=int, default=2, help="batches per optimiser step (effective batch = batch size x this)")
+    parser.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm running statistics fixed; affine parameters still train")
+    parser.add_argument("--lr", type=float, default=1e-3, help="peak AdamW learning rate for the heads and the attention block")
+    parser.add_argument("--backbone-lr", type=float, default=2e-4, help="peak AdamW learning rate for the RGB and pose backbones")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW decoupled weight decay")
-    parser.add_argument("--warmup-epochs", type=float, default=1.0)
+    parser.add_argument("--warmup-epochs", type=float, default=2.0)
     parser.add_argument("--grad-clip", type=float, default=5.0, help="clip the gradient norm to this value before each step (0 disables clipping)")
     parser.add_argument("--label-smoothing", type=float, default=0.05)
-    parser.add_argument("--loss", choices=["ce", "focal"], default="ce", help="ce: weighted cross entropy; focal: FocalCrossEntropy")
-    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--loss", choices=["ce", "focal"], default="focal", help="ce: weighted cross entropy; focal: FocalCrossEntropy")
+    parser.add_argument("--focal-gamma", type=float, default=1.0)
     parser.add_argument("--rgb-weight", type=float, default=0.5, help="weight of the RGB stream when fusing scores")
+    parser.add_argument("--dropout", type=float, default=0.5, help="dropout before each classifier head")
+    parser.add_argument("--min-score", type=float, default=0.1, help="joints at or below this keypoint confidence are left out of the pose heatmaps")
     parser.add_argument("--init-rgb", type=Path, default=None, help="official EPAM-Net RGB checkpoint (.pth) for the RGB backbone")
     parser.add_argument("--init-pose", type=Path, default=None, help="official EPAM-Net pose checkpoint (.pth) for the pose backbone")
     parser.add_argument(
         "--sigma", type=parse_sigma, default=0.6,
         help="Gaussian radius of the pose heatmaps: one value for all joints, or 17 comma-separated values, one per COCO joint",
     )
-    parser.add_argument("--patience", type=int, default=10, help="stop after this many epochs without an accuracy gain")
+    parser.add_argument("--patience", type=int, default=10, help="stop after this many epochs without a macro-F1 gain")
     parser.add_argument("--quality", choices=["all", "good"], default="all", help="which paired windows to use")
     parser.add_argument("--workers", type=int, default=4, help="data loading processes")
     parser.add_argument("--device", default=None, help="cuda or cpu (default: cuda if available, else cpu)")
@@ -337,6 +408,8 @@ def main() -> None:
     config = EPAMNetConfig(
         num_classes=n_classes,
         rgb_weight=args.rgb_weight,
+        dropout=args.dropout,
+        min_score=args.min_score,
         sigma=args.sigma,
         id2label=dict(enumerate(names)),
         label2id={n: i for i, n in enumerate(names)},
@@ -351,15 +424,27 @@ def main() -> None:
         print(f"pose backbone initialised from {args.init_pose.name}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"parameters {n_params / 1e6:.2f}M")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    steps_per_epoch = len(train_loader)
+    # Group 0 (heads and attention) comes first so param_groups[0] keeps reporting the head LR.
+    backbone_params = [*model.rgb_backbone.parameters(), *model.pose_backbone.parameters()]
+    backbone_ids = {id(p) for p in backbone_params}
+    head_params = [p for p in model.parameters() if id(p) not in backbone_ids]
+    optimizer = torch.optim.AdamW(
+        [{"params": head_params, "lr": args.lr}, {"params": backbone_params, "lr": args.backbone_lr}],
+        weight_decay=args.weight_decay,
+    )
+    steps_per_epoch = math.ceil(len(train_loader) / args.accum_steps)  # optimiser steps, not batches
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(args.warmup_epochs * steps_per_epoch))
-    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1 / warmup_steps, end_factor=1.0, total_iters=warmup_steps)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.01 * args.lr
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+    cosine_steps = max(1, total_steps - warmup_steps)
+
+    def lr_factor(step: int) -> float:
+        """Linear warm-up from 1/warmup_steps to 1, then cosine decay to 1% of the peak. Applied to each group's peak LR."""
+        if step < warmup_steps:
+            return 1 / warmup_steps + (1 - 1 / warmup_steps) * step / warmup_steps
+        progress = min(1.0, (step - warmup_steps) / cosine_steps)
+        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_factor)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     best_dir, ckpt_dir = out_dir / "best", out_dir / "checkpoint"
@@ -369,27 +454,36 @@ def main() -> None:
         api.create_repo(args.hub_repo, private=not args.hub_public, exist_ok=True)
         print(f"pushing to https://huggingface.co/{args.hub_repo}")
     run = None
+    commit = boxing_commit()
+    print(f"boxing commit {commit or 'unknown'}")
     if not args.no_wandb:
         run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_name,
-            config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+            config={
+                **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                "git_commit": commit,
+            },
             job_type="train",
         )
-    best_acc, best_epoch, history = -1.0, 0, []
+        if commit:
+            run.summary["git_commit"] = commit
+            run.tags = (*run.tags, f"commit:{commit[:7]}")
+    best_f1, best_epoch, history = -1.0, 0, []
     for epoch in range(1, args.epochs + 1):
         started = time.time()
         loss, grad = train_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every,
             grad_clip=args.grad_clip if args.grad_clip > 0 else math.inf,
+            accum_steps=args.accum_steps, freeze_bn=args.freeze_bn,
         )
         val = evaluate(model, val_loader, device, n_classes, args.rgb_weight)
-        acc = val["fused"]["accuracy"]
         f1 = val["fused"]["macro_f1"]
         row = {
             "epoch": epoch,
             "loss": loss,
             "lr": optimizer.param_groups[0]["lr"],
+            "lr_backbone": optimizer.param_groups[1]["lr"],
             "val_acc": val["fused"]["accuracy"],
             "val_macro_precision": val["fused"]["macro_precision"],
             "val_macro_recall": val["fused"]["macro_recall"],
@@ -405,6 +499,7 @@ def main() -> None:
                 {
                     "epoch/train_loss": loss,
                     "epoch/lr": row["lr"],
+                    "epoch/lr_backbone": row["lr_backbone"],
                     "epoch/val_acc": row["val_acc"],
                     "epoch/val_macro_precision": row["val_macro_precision"],
                     "epoch/val_macro_recall": row["val_macro_recall"],
@@ -420,10 +515,10 @@ def main() -> None:
                 step=scheduler.last_epoch,
             )
         marker = ""
-        if acc > best_acc:
-            best_acc, best_epoch, marker = acc, epoch, " *"
+        if f1 > best_f1:
+            best_f1, best_epoch, marker = f1, epoch, " *"
             model.save_pretrained(best_dir)
-            push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val accuracy {acc:.3f}")
+            push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val macro F1 {f1:.3f}")
         print(
             f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  "
             f"macro P {row['val_macro_precision']:.3f} R {row['val_macro_recall']:.3f} F1 {f1:.3f} "
@@ -437,7 +532,7 @@ def main() -> None:
                 "epoch": epoch,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
-                "best_acc": best_acc,
+                "best_f1": best_f1,
                 "best_epoch": best_epoch,
                 "history": history,
             },
@@ -445,14 +540,14 @@ def main() -> None:
         )
         push_folder(api, args.hub_repo, ckpt_dir, "checkpoints/last", f"Checkpoint: epoch {epoch}")
         if epoch - best_epoch >= args.patience:
-            print(f"no accuracy gain for {args.patience} epochs, stopping")
+            print(f"no macro-F1 gain for {args.patience} epochs, stopping")
             break
 
     # Report the best checkpoint, reloaded from disk into a fresh model, not the last epoch.
     reloaded = EPAMNet.from_pretrained(best_dir).to(device)
     final = evaluate(reloaded, val_loader, device, n_classes, reloaded.config.rgb_weight)
-    if args.test and not math.isclose(final["fused"]["accuracy"], best_acc, abs_tol=1e-6):
-        raise RuntimeError(f"reloaded checkpoint scores {final['fused']['accuracy']:.4f}, expected {best_acc:.4f}")
+    if args.test and not math.isclose(final["fused"]["macro_f1"], best_f1, abs_tol=1e-6):
+        raise RuntimeError(f"reloaded checkpoint scores {final['fused']['macro_f1']:.4f}, expected {best_f1:.4f}")
     print(f"\nbest epoch {best_epoch}" + ("  (checkpoint reload verified)" if args.test else ""))
     print("fused prediction:")
     print_report(final["fused"], names)
@@ -492,6 +587,10 @@ def main() -> None:
                 "final/macro_f1_rgb": final["rgb"]["macro_f1"],
                 "final/macro_f1_pose": final["pose"]["macro_f1"],
             }
+        )
+        wandb.log(
+            {"final/confusion_matrix": wandb_confusion_matrix(final["fused"]["cm"], names)},
+            step=scheduler.last_epoch,
         )
         run.finish()
     # The model card is written last, from the reloaded checkpoint's final scores, then pushed with the metrics.

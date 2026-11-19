@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from dotenv import load_dotenv
 from huggingface_hub import HfApi, ModelCard, ModelCardData
@@ -166,17 +167,30 @@ def print_report(result: dict, names: list[str]) -> None:
 
 @torch.no_grad()
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, n_classes: int, rgb_weight: float) -> dict:
-    """Scores for the fused prediction and for each stream alone."""
+    """Scores for the fused prediction and for each stream alone, plus the validation loss.
+
+    The loss is plain, unweighted cross entropy (no focal term, no label smoothing, no class
+    weights), so it does not depend on the training loss settings and can be compared across runs.
+    ``loss`` is the sum of the two heads' losses, like the training objective; ``loss_rgb`` and
+    ``loss_pose`` are the heads' means.
+    """
     model.eval()
     ys, fused, rgb, pose = [], [], [], []
+    loss_rgb = loss_pose = 0.0
     for images, keypoints, y in loader:
         out = model(images.to(device), keypoints.to(device))
+        loss_rgb += F.cross_entropy(out.rgb_logits, y.to(device), reduction="sum").item()
+        loss_pose += F.cross_entropy(out.pose_logits, y.to(device), reduction="sum").item()
         fused.append(out.probabilities(rgb_weight).argmax(-1).cpu().numpy())
         rgb.append(out.rgb_logits.argmax(-1).cpu().numpy())
         pose.append(out.pose_logits.argmax(-1).cpu().numpy())
         ys.append(y.numpy())
     y = np.concatenate(ys)
+    loss_rgb, loss_pose = loss_rgb / len(y), loss_pose / len(y)
     return {
+        "loss": loss_rgb + loss_pose,
+        "loss_rgb": loss_rgb,
+        "loss_pose": loss_pose,
         "fused": score(y, np.concatenate(fused), n_classes),
         "rgb": score(y, np.concatenate(rgb), n_classes),
         "pose": score(y, np.concatenate(pose), n_classes),
@@ -248,12 +262,13 @@ the most common class, so the macro F1 is the number to watch.
 
 ## Training
 
-AdamW (weight decay {args.weight_decay}), with a
+AdamW (weight decay {args.weight_decay} on weights only), with a
 {args.warmup_epochs:g}-epoch warm-up then cosine decay (peak {args.lr} for the heads and attention, {args.backbone_lr} for the
 backbones), batch size {args.batch_size},
 {args.loss} loss (label smoothing {args.label_smoothing}), inverse-square-root class weights,
 effective batch {args.batch_size * args.accum_steps} ({args.batch_size} clips x {args.accum_steps} accumulated batches),
 BatchNorm statistics {"frozen" if args.freeze_bn else "updated"},
+no weight decay on BatchNorm and biases, boxer-swap augmentation {"off" if args.no_swap else "on"},
 seed {args.seed}. Windows quality filter: `{args.quality}`.
 
 ## Limitations
@@ -262,6 +277,28 @@ Trained on a small set of annotated fights, so it may not transfer to other came
 styles. The pose input comes from a separate keypoint detector, and its errors carry through. The
 validation split was used to pick the checkpoint, so the scores above are slightly optimistic.
 """
+
+
+def param_groups(model: EPAMNet, lr: float, backbone_lr: float, weight_decay: float) -> list[dict]:
+    """AdamW groups: heads and attention, backbones, each split into decayed and not decayed.
+
+    Weight decay is skipped for BatchNorm weights and for every bias (all the parameters with one
+    dimension), which it would only pull towards zero. Groups 0 and 1 are the decayed head and
+    backbone groups, so ``param_groups[0]`` and ``[1]`` keep reporting the head and backbone LR.
+    """
+    backbone_ids = {id(p) for p in (*model.rgb_backbone.parameters(), *model.pose_backbone.parameters())}
+    buckets: dict[tuple[bool, bool], list[nn.Parameter]] = {(h, d): [] for h in (True, False) for d in (True, False)}
+    for p in model.parameters():
+        if p.requires_grad:
+            buckets[(id(p) not in backbone_ids, p.ndim > 1)].append(p)
+    groups = []
+    for is_head, decay in ((True, True), (False, True), (True, False), (False, False)):
+        if buckets[(is_head, decay)]:
+            groups.append(
+                {"params": buckets[(is_head, decay)], "lr": lr if is_head else backbone_lr,
+                 "weight_decay": weight_decay if decay else 0.0}
+            )
+    return groups
 
 
 def push_folder(api: HfApi | None, repo: str, folder: Path, path_in_repo: str, message: str) -> None:
@@ -333,12 +370,12 @@ def main() -> None:
     parser.add_argument("--pairs", type=Path, default=Path("data/processed/punch-pairs"), help="output of boxing.pairing")
     parser.add_argument("--src", type=Path, default=Path("data/processed/punch-seq"), help="clips and frames from boxing.preprocess")
     parser.add_argument("--out", type=Path, default=None, help="default: runs/epam-net, or runs/epam-test with --test")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=16, help="clips per forward pass; BatchNorm statistics are computed over these")
     parser.add_argument("--accum-steps", type=int, default=2, help="batches per optimiser step (effective batch = batch size x this)")
     parser.add_argument("--freeze-bn", action="store_true", help="keep BatchNorm running statistics fixed; affine parameters still train")
     parser.add_argument("--lr", type=float, default=1e-3, help="peak AdamW learning rate for the heads and the attention block")
-    parser.add_argument("--backbone-lr", type=float, default=2e-4, help="peak AdamW learning rate for the RGB and pose backbones")
+    parser.add_argument("--backbone-lr", type=float, default=1e-4, help="peak AdamW learning rate for the RGB and pose backbones")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW decoupled weight decay")
     parser.add_argument("--warmup-epochs", type=float, default=2.0)
     parser.add_argument("--grad-clip", type=float, default=5.0, help="clip the gradient norm to this value before each step (0 disables clipping)")
@@ -354,6 +391,7 @@ def main() -> None:
         "--sigma", type=parse_sigma, default=0.6,
         help="Gaussian radius of the pose heatmaps: one value for all joints, or 17 comma-separated values, one per COCO joint",
     )
+    parser.add_argument("--no-swap", action="store_true", help="do not randomly swap the two boxers' keypoint rows when augmenting")
     parser.add_argument("--patience", type=int, default=10, help="stop after this many epochs without a macro-F1 gain")
     parser.add_argument("--quality", choices=["all", "good"], default="all", help="which paired windows to use")
     parser.add_argument("--workers", type=int, default=4, help="data loading processes")
@@ -385,7 +423,7 @@ def main() -> None:
 
     names = load_names(args.pairs)
     n_classes = len(names)
-    train_ds = EPAMDataset(args.pairs, args.src, "train", args.quality, augment=True, limit=TEST_TRAIN_WINDOWS if args.test else None)
+    train_ds = EPAMDataset(args.pairs, args.src, "train", args.quality, augment=True, swap_players=not args.no_swap, limit=TEST_TRAIN_WINDOWS if args.test else None)
     val_ds = EPAMDataset(args.pairs, args.src, "val", args.quality, limit=TEST_VAL_WINDOWS if args.test else None)
     mode = "TEST MODE (a few windows, metrics are meaningless)" if args.test else "full run"
     print(f"{mode}\ndevice {device}  train {len(train_ds)}  val {len(val_ds)}  quality={args.quality}  out={out_dir}")
@@ -424,14 +462,7 @@ def main() -> None:
         print(f"pose backbone initialised from {args.init_pose.name}")
     n_params = sum(p.numel() for p in model.parameters())
     print(f"parameters {n_params / 1e6:.2f}M")
-    # Group 0 (heads and attention) comes first so param_groups[0] keeps reporting the head LR.
-    backbone_params = [*model.rgb_backbone.parameters(), *model.pose_backbone.parameters()]
-    backbone_ids = {id(p) for p in backbone_params}
-    head_params = [p for p in model.parameters() if id(p) not in backbone_ids]
-    optimizer = torch.optim.AdamW(
-        [{"params": head_params, "lr": args.lr}, {"params": backbone_params, "lr": args.backbone_lr}],
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(param_groups(model, args.lr, args.backbone_lr, args.weight_decay))
     steps_per_epoch = math.ceil(len(train_loader) / args.accum_steps)  # optimiser steps, not batches
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(args.warmup_epochs * steps_per_epoch))
@@ -484,6 +515,9 @@ def main() -> None:
             "loss": loss,
             "lr": optimizer.param_groups[0]["lr"],
             "lr_backbone": optimizer.param_groups[1]["lr"],
+            "val_loss": val["loss"],
+            "val_loss_rgb": val["loss_rgb"],
+            "val_loss_pose": val["loss_pose"],
             "val_acc": val["fused"]["accuracy"],
             "val_macro_precision": val["fused"]["macro_precision"],
             "val_macro_recall": val["fused"]["macro_recall"],
@@ -500,6 +534,9 @@ def main() -> None:
                     "epoch/train_loss": loss,
                     "epoch/lr": row["lr"],
                     "epoch/lr_backbone": row["lr_backbone"],
+                    "epoch/val_loss": row["val_loss"],
+                    "epoch/val_loss_rgb": row["val_loss_rgb"],
+                    "epoch/val_loss_pose": row["val_loss_pose"],
                     "epoch/val_acc": row["val_acc"],
                     "epoch/val_macro_precision": row["val_macro_precision"],
                     "epoch/val_macro_recall": row["val_macro_recall"],
@@ -520,7 +557,7 @@ def main() -> None:
             model.save_pretrained(best_dir)
             push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val macro F1 {f1:.3f}")
         print(
-            f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  "
+            f"epoch {epoch:>3}  loss {loss:.4f}  val loss {row['val_loss']:.3f}  val acc {row['val_acc']:.3f}  "
             f"macro P {row['val_macro_precision']:.3f} R {row['val_macro_recall']:.3f} F1 {f1:.3f} "
             f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  "
             f"grad {grad['grad_norm_mean']:.2f} max {grad['grad_norm_max']:.2f} clipped {grad['clipped_share']:.0%}  "

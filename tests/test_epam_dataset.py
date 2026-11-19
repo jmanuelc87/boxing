@@ -15,6 +15,7 @@ from boxing.epam_dataset import (
     jitter_crop,
     keypoints_in_crop,
     mirror,
+    swap_players,
 )
 
 W, H, T = 128, 96, 16
@@ -130,6 +131,30 @@ def test_training_smoke_test_runs_every_stage(data, tmp_path, monkeypatch):
     assert metrics["test_mode"] is True and len(metrics["history"]) == train.TEST_EPOCHS
     assert (out / "best" / "model.safetensors").exists() and (out / "best" / "README.md").exists()
     assert {"loss", "lr", "val_macro_f1", "val_macro_f1_rgb", "val_macro_f1_pose"} <= set(metrics["history"][0])
+    assert {"val_loss", "val_loss_rgb", "val_loss_pose"} <= set(metrics["history"][0])
+    assert metrics["history"][0]["val_loss"] == pytest.approx(
+        metrics["history"][0]["val_loss_rgb"] + metrics["history"][0]["val_loss_pose"]
+    )
+
+
+def test_swap_players_exchanges_the_rows_without_touching_the_input():
+    kp = np.arange(2 * T * 17 * 3, dtype=np.float32).reshape(2, T, 17, 3)
+    swapped = swap_players(kp)
+    np.testing.assert_array_equal(swapped[0], kp[1])
+    np.testing.assert_array_equal(swapped[1], kp[0])
+    np.testing.assert_array_equal(swap_players(swapped), kp)
+
+
+def test_param_groups_skip_decay_for_batchnorm_and_biases():
+    from boxing.model import EPAMNet, EPAMNetConfig
+
+    model = EPAMNet(EPAMNetConfig(rgb_blocks=(1, 1, 1, 1), rgb_channels=(8, 16, 24, 32), pose_blocks=(1, 1, 1), pose_channels=(8, 16, 24)))
+    groups = train.param_groups(model, lr=1e-3, backbone_lr=1e-4, weight_decay=0.1)
+    assert [g["weight_decay"] for g in groups] == [0.1, 0.1, 0.0, 0.0]
+    assert [g["lr"] for g in groups] == [1e-3, 1e-4, 1e-3, 1e-4]
+    assert sum(len(g["params"]) for g in groups) == len(list(model.parameters()))
+    assert all(p.ndim > 1 for g in groups[:2] for p in g["params"])
+    assert all(p.ndim <= 1 for g in groups[2:] for p in g["params"])
 
 
 def test_lr_factor_warms_up_then_decays():

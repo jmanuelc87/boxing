@@ -12,7 +12,9 @@ the 224x224 frame. Images and keypoints share one crop, which is what the pose h
 line up with the RGB features.
 
 Training augmentation: random crop scale and shift, horizontal mirror (with the left and right
-joints swapped, so the class is unchanged), and brightness and contrast jitter.
+joints swapped, so the class is unchanged), brightness and contrast jitter, and a random swap of
+the two boxers' keypoint rows. The rows are ordered by track id, which carries no meaning, so the
+swap stops the pose stream from reading a role into the order.
 
     ds = EPAMDataset(Path("data/processed/punch-pairs"), Path("data/processed/punch-seq"), "train", augment=True)
     images, keypoints, label = ds[0]
@@ -86,6 +88,11 @@ def mirror(images: np.ndarray, kp: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return images[:, :, ::-1], flipped
 
 
+def swap_players(kp: np.ndarray) -> np.ndarray:
+    """Exchange the two boxers' keypoint rows of ``(2, T, 17, 3)``. Returns a copy."""
+    return kp[::-1].copy()
+
+
 class EPAMDataset(Dataset):
     """One item per paired window: RGB frames and keypoints in one shared crop.
 
@@ -102,11 +109,13 @@ class EPAMDataset(Dataset):
         quality: str = "all",
         augment: bool = False,
         limit: int | None = None,
+        swap_players: bool = True,
     ):
         if quality not in ("all", "good"):
             raise ValueError(f"quality must be 'all' or 'good', got {quality!r}")
         self.src = Path(src)
         self.augment = augment
+        self.swap_players = swap_players
         data = np.load(Path(pairs) / f"{split}.npz")
         self.X, self.labels = data["X"], data["y"].astype(np.int64)
         meta = _read_jsonl(Path(pairs) / f"{split}.jsonl")
@@ -162,6 +171,8 @@ class EPAMDataset(Dataset):
         if rng is not None:
             if rng.random() < 0.5:
                 images, kp = mirror(images, kp)
+            if self.swap_players and rng.random() < 0.5:
+                kp = swap_players(kp)
             images = images.astype(np.float32) / 255.0
             images = (images - 0.5) * rng.uniform(0.8, 1.2) + 0.5 + rng.uniform(-0.1, 0.1)
             images = np.clip(images, 0.0, 1.0)

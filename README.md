@@ -1,6 +1,6 @@
 # Boxing punch detection
 
-![Punch detection example](media/train_boxes.gif)
+<p align="center"><img src="media/train_boxes.gif" alt="Punch detection example"></p>
 
 *Training clip from `task_kam4_gh099681`: the yellow box marks a "Jab fallido" (left-hand miss).*
 
@@ -30,13 +30,13 @@ flowchart TB
     model --> out
 ```
 
-| stage | command | input | output |
-|---|---|---|---|
-| 1. Clips | `boxing.preprocess` | CVAT tracks, MP4 videos | `data/processed/punch-seq/`: 16-frame clips with a box and class per frame |
-| 2. Keypoints | `boxing.keypoints` | the clips' frames | `data/processed/punch-keypoints-boxers/`: one JSON per frame |
-| 3. Pairing | `boxing.pairing` | clips + keypoints | `data/processed/punch-pairs/`: `X` of shape `(N, 2, 16, 17, 3)` |
-| 4. Crop and augment | `boxing.epam_dataset` | clips and keypoints | 224×224 RGB frames and keypoints in the same crop; crop, mirror and brightness jitter during training |
-| 5. Classify | `boxing.train_punch_classifier` | crops and keypoints | logits from each stream, fused for the prediction, plus the best checkpoint |
+| stage               | command                         | input                   | output                                                                                                |
+| ------------------- | ------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------- |
+| 1. Clips            | `boxing.preprocess`             | CVAT tracks, MP4 videos | `data/processed/punch-seq/`: 16-frame clips with a box and class per frame                            |
+| 2. Keypoints        | `boxing.keypoints`              | the clips' frames       | `data/processed/punch-keypoints-boxers/`: one JSON per frame                                          |
+| 3. Pairing          | `boxing.pairing`                | clips + keypoints       | `data/processed/punch-pairs/`: `X` of shape `(N, 2, 16, 17, 3)`                                       |
+| 4. Crop and augment | `boxing.epam_dataset`           | clips and keypoints     | 224×224 RGB frames and keypoints in the same crop; crop, mirror and brightness jitter during training |
+| 5. Classify         | `boxing.train_punch_classifier` | crops and keypoints     | logits from each stream, fused for the prediction, plus the best checkpoint                           |
 
 Steps 4 and 5 run inside one training command. The full sequence:
 
@@ -55,15 +55,21 @@ uv run python -m boxing.train_punch_classifier          # full training run
 
 **Stage 2, keypoints.** The pose model finds 17 joints on every person in the frame, including the referee and the audience:
 
-![Keypoints on everyone in the ring](media/keypoints.gif)
+<p align="center"><img src="media/keypoints.gif" alt="Keypoints on everyone in the ring"></p>
 
 *Skeletons on every detected person. The label is the clip's class (here "Cruzado fallido").*
 
 **Stage 2 with the boxer filter.** The role classifier drops the referee and everyone else, keeping the red and blue boxers. Those two skeletons are what `boxing.pairing` turns into the two boxers of each window:
 
-![Keypoints on the two boxers only](media/keypoints-two-players.gif)
+<p align="center"><img src="media/keypoints-two-players.gif" alt="Keypoints on the two boxers only"></p>
 
 *Only the two boxers are kept (here "Cruzado al cuerpo").*
+
+**The model's input.** The same windows reach EPAM-Net as one crop per boxer, with and without keypoints. One sample per class is shown here:
+
+<p align="center"><img src="media/model-input-sequence.gif" alt="Model input: one sample per class"></p>
+
+*Eight samples, one per class (seed 42). Each frame shows player 1 and player 2 as plain crops, then with their keypoints.*
 
 ## Dataset: Olympic Boxing Punch Classification Video Dataset
 
@@ -83,12 +89,12 @@ data/raw/punch/
 
 Each `annotations.json` is a single-element JSON list. The element has four keys:
 
-| key       | contents                                   |
-|-----------|--------------------------------------------|
-| `version` | CVAT export version (18 in the sample)     |
-| `tags`    | always empty                               |
-| `shapes`  | always empty (no frame-level shapes)       |
-| `tracks`  | list of punch events, one per track        |
+| key       | contents                               |
+| --------- | -------------------------------------- |
+| `version` | CVAT export version (18 in the sample) |
+| `tags`    | always empty                           |
+| `shapes`  | always empty (no frame-level shapes)   |
+| `tracks`  | list of punch events, one per track    |
 
 Each **track** is one punch event:
 
@@ -121,16 +127,16 @@ Each **track** is one punch event:
 
 The raw labels are in Polish. There are 8 classes: a target or outcome (head, body, block, miss) combined with a hand (left or right). `preprocess.py` translates each one to a Spanish boxing term and assigns a fixed class id:
 
-| id | raw label (Polish)       | English               | processed name (Spanish) | count |
-|---:|--------------------------|-----------------------|--------------------------|------:|
-|  0 | `Głowa lewą ręką`        | head, left hand       | `Jab a la cabeza`        | 1,683 |
-|  1 | `Głowa prawą ręką`       | head, right hand      | `Cruzado a la cabeza`    |   833 |
-|  2 | `Chybienie lewą ręką`    | miss, left hand       | `Jab fallido`            |   734 |
-|  3 | `Chybienie prawą ręką`   | miss, right hand      | `Cruzado fallido`        |   449 |
-|  4 | `Blok lewą ręką`         | block, left hand      | `Bloqueo de jab`         |   360 |
-|  5 | `Blok prawą ręką`        | block, right hand     | `Bloqueo de cruzado`     |   178 |
-|  6 | `Korpus lewą ręką`       | body, left hand       | `Jab al cuerpo`          |   193 |
-|  7 | `Korpus prawą ręką`      | body, right hand      | `Cruzado al cuerpo`      |   179 |
+|   id | raw label (Polish)     | English           | processed name (Spanish) | count |
+| ---: | ---------------------- | ----------------- | ------------------------ | ----: |
+|    0 | `Głowa lewą ręką`      | head, left hand   | `Jab a la cabeza`        | 1,683 |
+|    1 | `Głowa prawą ręką`     | head, right hand  | `Cruzado a la cabeza`    |   833 |
+|    2 | `Chybienie lewą ręką`  | miss, left hand   | `Jab fallido`            |   734 |
+|    3 | `Chybienie prawą ręką` | miss, right hand  | `Cruzado fallido`        |   449 |
+|    4 | `Blok lewą ręką`       | block, left hand  | `Bloqueo de jab`         |   360 |
+|    5 | `Blok prawą ręką`      | block, right hand | `Bloqueo de cruzado`     |   178 |
+|    6 | `Korpus lewą ręką`     | body, left hand   | `Jab al cuerpo`          |   193 |
+|    7 | `Korpus prawą ręką`    | body, right hand  | `Cruzado al cuerpo`      |   179 |
 
 Counts are across all 29 files. The total is 4,609 tracks and 22,274 keyframe boxes.
 
@@ -156,13 +162,13 @@ uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq
 uv run python -m boxing.preprocess data/raw/punch data/processed/punch-seq-test --test   # quick check
 ```
 
-| option           | default | meaning                                                  |
-|------------------|--------:|----------------------------------------------------------|
-| `--max-size`     |     640 | resize so the longest image side is this many pixels     |
-| `--val-fraction` |     0.2 | fraction of tasks held out for validation                |
-| `--seed`         |       0 | seed for the train/val split                             |
-| `--seq-len`      |      16 | frames per clip (also written to `labels.json`)          |
-| `--test`         |     off | small end-to-end run: 3 tasks, first 5 clips of each     |
+| option           | default | meaning                                              |
+| ---------------- | ------: | ---------------------------------------------------- |
+| `--max-size`     |     640 | resize so the longest image side is this many pixels |
+| `--val-fraction` |     0.2 | fraction of tasks held out for validation            |
+| `--seed`         |       0 | seed for the train/val split                         |
+| `--seq-len`      |      16 | frames per clip (also written to `labels.json`)      |
+| `--test`         |     off | small end-to-end run: 3 tasks, first 5 clips of each |
 
 The clip length is `SEQ_LEN = 16` in `preprocess.py` (0.32 s at 50 fps). Punch tracks last 4 frames at the median, 12 at the 99th percentile and 19 at most, so 16 frames hold almost every punch plus context on both sides.
 
@@ -210,17 +216,17 @@ One JSON object per line, one line per clip (`frames` shortened here; it always 
 }
 ```
 
-| field            | meaning                                                                        |
-|------------------|--------------------------------------------------------------------------------|
-| `task`           | recording session the clip comes from                                          |
-| `track`          | index of the clip's punch in that task's `annotations.json` `tracks` list      |
-| `label`          | class id of that punch (metadata; training uses the per-frame targets)         |
-| `start`          | frame number of the first frame                                                |
-| `width`/`height` | size of the saved JPEGs in pixels                                              |
-| `frames`         | the 16 frames in order, each with `image`, `class_labels` and `boxes`          |
-| `frames[].image` | path relative to the processed dataset folder                                  |
-| `frames[].class_labels` | class id for each box on that frame (see the label table)               |
-| `frames[].boxes` | `[cx, cy, w, h]` per box, normalised to `[0, 1]`; same order as `class_labels` |
+| field                   | meaning                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `task`                  | recording session the clip comes from                                          |
+| `track`                 | index of the clip's punch in that task's `annotations.json` `tracks` list      |
+| `label`                 | class id of that punch (metadata; training uses the per-frame targets)         |
+| `start`                 | frame number of the first frame                                                |
+| `width`/`height`        | size of the saved JPEGs in pixels                                              |
+| `frames`                | the 16 frames in order, each with `image`, `class_labels` and `boxes`          |
+| `frames[].image`        | path relative to the processed dataset folder                                  |
+| `frames[].class_labels` | class id for each box on that frame (see the label table)                      |
+| `frames[].boxes`        | `[cx, cy, w, h]` per box, normalised to `[0, 1]`; same order as `class_labels` |
 
 ### `labels.json`
 
@@ -286,24 +292,24 @@ uv run python -m boxing.train_punch_classifier
 uv run python -m boxing.train_punch_classifier --epochs 40 --batch-size 8 --lr 0.01 --out runs/epam-run2
 ```
 
-| option | default | meaning |
-|---|---:|---|
-| `--pairs` | `data/processed/punch-pairs` | output of `boxing.pairing` |
-| `--src` | `data/processed/punch-seq` | clips and frames from `boxing.preprocess` |
-| `--out` | `runs/epam-net` | where the checkpoint and metrics go |
-| `--epochs` | 30 | training epochs |
-| `--batch-size` | 8 | clips per step |
-| `--lr` | 0.01 | base learning rate (SGD, momentum 0.9) |
-| `--warmup-epochs` | 1 | linear warm-up before the cosine decay |
-| `--weight-decay` | 3e-4 | SGD weight decay |
-| `--loss` | `ce` | `ce` (class-weighted cross entropy) or `focal` (with `--focal-gamma`, default 2) |
-| `--label-smoothing` | 0.05 | smoothing for the cross entropy |
-| `--rgb-weight` | 0.5 | weight of the RGB stream when the two streams' scores are fused |
-| `--patience` | 10 | stop after this many epochs without a gain in validation macro F1 |
-| `--quality` | `all` | `all` keeps every window with at least one boxer tracked; `good` keeps only windows with both boxers on every frame |
-| `--workers` | 4 | data-loading processes |
-| `--device` | auto | `cuda` or `cpu` (cuda if available) |
-| `--seed` | 0 | random seed |
+| option              |                      default | meaning                                                                                                             |
+| ------------------- | ---------------------------: | ------------------------------------------------------------------------------------------------------------------- |
+| `--pairs`           | `data/processed/punch-pairs` | output of `boxing.pairing`                                                                                          |
+| `--src`             |   `data/processed/punch-seq` | clips and frames from `boxing.preprocess`                                                                           |
+| `--out`             |              `runs/epam-net` | where the checkpoint and metrics go                                                                                 |
+| `--epochs`          |                           30 | training epochs                                                                                                     |
+| `--batch-size`      |                            8 | clips per step                                                                                                      |
+| `--lr`              |                         0.01 | base learning rate (SGD, momentum 0.9)                                                                              |
+| `--warmup-epochs`   |                            1 | linear warm-up before the cosine decay                                                                              |
+| `--weight-decay`    |                         3e-4 | SGD weight decay                                                                                                    |
+| `--loss`            |                         `ce` | `ce` (class-weighted cross entropy) or `focal` (with `--focal-gamma`, default 2)                                    |
+| `--label-smoothing` |                         0.05 | smoothing for the cross entropy                                                                                     |
+| `--rgb-weight`      |                          0.5 | weight of the RGB stream when the two streams' scores are fused                                                     |
+| `--patience`        |                           10 | stop after this many epochs without a gain in validation macro F1                                                   |
+| `--quality`         |                        `all` | `all` keeps every window with at least one boxer tracked; `good` keeps only windows with both boxers on every frame |
+| `--workers`         |                            4 | data-loading processes                                                                                              |
+| `--device`          |                         auto | `cuda` or `cpu` (cuda if available)                                                                                 |
+| `--seed`            |                            0 | random seed                                                                                                         |
 
 Each epoch prints the training loss, the validation accuracy and macro F1 of the fused prediction, and the macro F1 of each stream alone. A `*` marks a new best. The best checkpoint (scored on validation) is kept.
 

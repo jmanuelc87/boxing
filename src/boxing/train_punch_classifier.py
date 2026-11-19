@@ -94,11 +94,21 @@ def class_metrics(cm: np.ndarray) -> dict[str, np.ndarray]:
 def score(y: np.ndarray, pred: np.ndarray, n_classes: int) -> dict:
     cm = confusion_matrix(y, pred, n_classes)
     m = class_metrics(cm)
-    return {"cm": cm, "accuracy": float((y == pred).mean()), "macro_f1": float(m["f1"].mean()), **m}
+    return {
+        "cm": cm,
+        "accuracy": float((y == pred).mean()),
+        "macro_precision": float(m["precision"].mean()),
+        "macro_recall": float(m["recall"].mean()),
+        "macro_f1": float(m["f1"].mean()),
+        **m,
+    }
 
 
 def print_report(result: dict, names: list[str]) -> None:
-    print(f"accuracy {result['accuracy']:.3f}  macro F1 {result['macro_f1']:.3f}")
+    print(
+        f"accuracy {result['accuracy']:.3f}  macro precision {result['macro_precision']:.3f}  "
+        f"macro recall {result['macro_recall']:.3f}  macro F1 {result['macro_f1']:.3f}"
+    )
     print(f"{'class':<22}{'prec':>7}{'rec':>7}{'f1':>7}{'n':>6}")
     for i, name in enumerate(names):
         print(f"{name:<22}{result['precision'][i]:>7.3f}{result['recall'][i]:>7.3f}{result['f1'][i]:>7.3f}{int(result['support'][i]):>6}")
@@ -179,11 +189,11 @@ The best epoch ({best_epoch}) by fused accuracy on the validation split. Train a
 separate fights, so these scores are on fights the model did not see. Macro F1 is shown beside
 accuracy because accuracy alone is dominated by the most common class.
 
-| | accuracy | macro F1 |
-|---|---|---|
-| fused (RGB + pose) | {fused['accuracy']:.3f} | {fused['macro_f1']:.3f} |
-| RGB stream alone | {result['rgb']['accuracy']:.3f} | {result['rgb']['macro_f1']:.3f} |
-| pose stream alone | {result['pose']['accuracy']:.3f} | {result['pose']['macro_f1']:.3f} |
+| | accuracy | macro precision | macro recall | macro F1 |
+|---|---|---|---|---|
+| fused (RGB + pose) | {fused['accuracy']:.3f} | {fused['macro_precision']:.3f} | {fused['macro_recall']:.3f} | {fused['macro_f1']:.3f} |
+| RGB stream alone | {result['rgb']['accuracy']:.3f} | {result['rgb']['macro_precision']:.3f} | {result['rgb']['macro_recall']:.3f} | {result['rgb']['macro_f1']:.3f} |
+| pose stream alone | {result['pose']['accuracy']:.3f} | {result['pose']['macro_precision']:.3f} | {result['pose']['macro_recall']:.3f} | {result['pose']['macro_f1']:.3f} |
 
 | class | precision | recall | F1 | support |
 |---|---|---|---|---|
@@ -215,14 +225,17 @@ def push_folder(api: HfApi | None, repo: str, folder: Path, path_in_repo: str, m
 
 
 def train_epoch(
-    model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int, log_every: int = 0
-) -> float:
+    model, loader, criterion, optimizer, scheduler, device, epoch: int, epochs: int, log_every: int = 0,
+    grad_clip: float = 5.0,
+) -> tuple[float, dict[str, float]]:
     """Train one epoch. With ``log_every`` > 0 and a live wandb run, push the loss and LR every that many steps.
 
-    Returns the mean loss over the epoch.
+    Returns the mean loss and the gradient-norm statistics: the norm before clipping at ``grad_clip``,
+    its mean and max over the epoch, and the share of steps that were clipped.
     """
     model.train()
     total, seen = 0.0, 0
+    norms = []
     bar = tqdm(loader, desc=f"epoch {epoch}/{epochs}", leave=False)
     for images, keypoints, y in bar:
         images, keypoints, y = images.to(device), keypoints.to(device), y.to(device)
@@ -230,6 +243,7 @@ def train_epoch(
         loss = criterion(out.rgb_logits, y) + criterion(out.pose_logits, y)
         optimizer.zero_grad()
         loss.backward()
+        norms.append(float(nn.utils.clip_grad_norm_(model.parameters(), grad_clip)))  # returns the norm before clipping
         optimizer.step()
         scheduler.step()
         total += loss.item() * len(y)
@@ -240,7 +254,12 @@ def train_epoch(
                 {"step/loss": loss.item(), "step/lr": optimizer.param_groups[0]["lr"], "epoch": epoch},
                 step=scheduler.last_epoch,
             )
-    return total / seen
+    grad = {
+        "grad_norm_mean": float(np.mean(norms)) if norms else 0.0,
+        "grad_norm_max": float(np.max(norms)) if norms else 0.0,
+        "clipped_share": float(np.mean(np.asarray(norms) > grad_clip)) if norms else 0.0,
+    }
+    return total / seen, grad
 
 
 def main() -> None:
@@ -253,6 +272,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3, help="peak AdamW learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="AdamW decoupled weight decay")
     parser.add_argument("--warmup-epochs", type=float, default=1.0)
+    parser.add_argument("--grad-clip", type=float, default=5.0, help="clip the gradient norm to this value before each step (0 disables clipping)")
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--loss", choices=["ce", "focal"], default="ce", help="ce: weighted cross entropy; focal: FocalCrossEntropy")
     parser.add_argument("--focal-gamma", type=float, default=2.0)
@@ -359,8 +379,9 @@ def main() -> None:
     best_acc, best_epoch, history = -1.0, 0, []
     for epoch in range(1, args.epochs + 1):
         started = time.time()
-        loss = train_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every
+        loss, grad = train_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, epoch, args.epochs, args.log_every,
+            grad_clip=args.grad_clip if args.grad_clip > 0 else math.inf,
         )
         val = evaluate(model, val_loader, device, n_classes, args.rgb_weight)
         acc = val["fused"]["accuracy"]
@@ -370,10 +391,13 @@ def main() -> None:
             "loss": loss,
             "lr": optimizer.param_groups[0]["lr"],
             "val_acc": val["fused"]["accuracy"],
+            "val_macro_precision": val["fused"]["macro_precision"],
+            "val_macro_recall": val["fused"]["macro_recall"],
             "val_macro_f1": f1,
             "val_macro_f1_rgb": val["rgb"]["macro_f1"],
             "val_macro_f1_pose": val["pose"]["macro_f1"],
             "seconds": time.time() - started,
+            **grad,
         }
         history.append(row)
         if run is not None:
@@ -382,10 +406,15 @@ def main() -> None:
                     "epoch/train_loss": loss,
                     "epoch/lr": row["lr"],
                     "epoch/val_acc": row["val_acc"],
+                    "epoch/val_macro_precision": row["val_macro_precision"],
+                    "epoch/val_macro_recall": row["val_macro_recall"],
                     "epoch/val_macro_f1": f1,
                     "epoch/val_macro_f1_rgb": row["val_macro_f1_rgb"],
                     "epoch/val_macro_f1_pose": row["val_macro_f1_pose"],
                     "epoch/seconds": row["seconds"],
+                    "epoch/grad_norm_mean": grad["grad_norm_mean"],
+                    "epoch/grad_norm_max": grad["grad_norm_max"],
+                    "epoch/clipped_share": grad["clipped_share"],
                     "epoch": epoch,
                 },
                 step=scheduler.last_epoch,
@@ -396,8 +425,10 @@ def main() -> None:
             model.save_pretrained(best_dir)
             push_folder(api, args.hub_repo, best_dir, ".", f"Best model: epoch {epoch}, val accuracy {acc:.3f}")
         print(
-            f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  macro F1 {f1:.3f} "
+            f"epoch {epoch:>3}  loss {loss:.4f}  val acc {row['val_acc']:.3f}  "
+            f"macro P {row['val_macro_precision']:.3f} R {row['val_macro_recall']:.3f} F1 {f1:.3f} "
             f"(rgb {row['val_macro_f1_rgb']:.3f}, pose {row['val_macro_f1_pose']:.3f})  "
+            f"grad {grad['grad_norm_mean']:.2f} max {grad['grad_norm_max']:.2f} clipped {grad['clipped_share']:.0%}  "
             f"{row['seconds']:.0f}s{marker}"
         )
         model.save_pretrained(ckpt_dir)
@@ -433,6 +464,8 @@ def main() -> None:
                 "test_mode": args.test,
                 "best_epoch": best_epoch,
                 "accuracy": final["fused"]["accuracy"],
+                "macro_precision": final["fused"]["macro_precision"],
+                "macro_recall": final["fused"]["macro_recall"],
                 "macro_f1": final["fused"]["macro_f1"],
                 "macro_f1_rgb": final["rgb"]["macro_f1"],
                 "macro_f1_pose": final["pose"]["macro_f1"],
@@ -453,6 +486,8 @@ def main() -> None:
             {
                 "best_epoch": best_epoch,
                 "final/accuracy": final["fused"]["accuracy"],
+                "final/macro_precision": final["fused"]["macro_precision"],
+                "final/macro_recall": final["fused"]["macro_recall"],
                 "final/macro_f1": final["fused"]["macro_f1"],
                 "final/macro_f1_rgb": final["rgb"]["macro_f1"],
                 "final/macro_f1_pose": final["pose"]["macro_f1"],

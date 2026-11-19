@@ -1,39 +1,11 @@
 import numpy as np
 import torch
 
-from boxing.pair_dataset import FLIP_PERM, augment_window, normalize_window
-
-
-def _window(t=16, seed=0):
-    rng = np.random.default_rng(seed)
-    w = rng.uniform(100, 500, size=(2, t, 17, 3)).astype(np.float32)
-    w[..., 2] = rng.uniform(0.3, 1.0, size=(2, t, 17))
-    return w
-
-
-def test_normalize_ignores_translation_and_zoom():
-    w = _window()
-    moved = w.copy()
-    moved[..., :2] = moved[..., :2] * 2.0 + 50.0
-    np.testing.assert_allclose(normalize_window(w), normalize_window(moved), atol=1e-4)
-
-
-def test_normalize_keeps_missing_people_at_zero():
-    w = _window()
-    w[1, 3:6] = 0.0
-    assert not normalize_window(w)[1, 3:6].any()
+from boxing.epam_dataset import FLIP_PERM
 
 
 def test_flip_permutation_is_an_involution():
     assert [FLIP_PERM[i] for i in FLIP_PERM] == list(range(17))
-
-
-def test_augment_keeps_shape_and_is_seeded():
-    x = normalize_window(_window())
-    a = augment_window(x, np.random.default_rng(1))
-    b = augment_window(x, np.random.default_rng(1))
-    assert a.shape == x.shape
-    np.testing.assert_array_equal(a, b)
 
 
 def test_focal_gamma_zero_matches_weighted_cross_entropy():

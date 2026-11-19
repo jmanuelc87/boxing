@@ -47,7 +47,6 @@ from tqdm import tqdm
 from boxing.epam_dataset import EPAMDataset
 from boxing.losses import FocalCrossEntropy
 from boxing.model import EPAMNet, EPAMNetConfig
-from boxing.pair_dataset import load_names
 from boxing.pretrained import load_official_backbone
 
 TEST_EPOCHS = 2
@@ -57,6 +56,10 @@ TEST_VAL_WINDOWS = 16
 TEST_WORKERS = 2
 HUB_REPO = "jmanuelc87/boxing-punch-epam-net"
 MODEL_OVERRIDES: dict = {}  # extra EPAMNetConfig fields; the tests shrink the network with this
+
+
+def load_names(root: Path) -> list[str]:
+    return json.loads((root / "labels.json").read_text(encoding="utf-8"))["names"]
 
 
 def pick_device(name: str | None) -> torch.device:

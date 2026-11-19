@@ -8,6 +8,7 @@ import torch
 
 from boxing import train_punch_classifier as train
 from boxing.epam_dataset import (
+    FLIP_PERM,
     IMAGE_SIZE,
     EPAMDataset,
     crop_square,
@@ -15,7 +16,6 @@ from boxing.epam_dataset import (
     keypoints_in_crop,
     mirror,
 )
-from boxing.pair_dataset import FLIP_PERM
 
 W, H, T = 128, 96, 16
 

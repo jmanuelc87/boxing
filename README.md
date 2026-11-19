@@ -14,7 +14,6 @@ flowchart TB
     clips["Clips<br/>16 frames, 640x360 JPEG,<br/>a punch box and class per frame"]
     kp["Per-frame keypoints<br/>17 COCO joints per person,<br/>red and blue boxers only"]
     pairs["Paired windows<br/>(2, 16, 17, 3): two boxers by track id,<br/>pixel x, y, score"]
-    norm["Normalised windows<br/>origin = first boxer hip centre,<br/>scale = first boxer torso length"]
     crops["RGB crops 224x224<br/>16 frames, one square crop around both boxers"]
     heat["Pose heatmaps 56x56<br/>34 Gaussian channels per frame"]
     model["EPAM-Net<br/>RGB and pose streams, pose-guided attention"]
@@ -24,9 +23,8 @@ flowchart TB
     clips -->|"boxing.keypoints"| kp
     clips -->|"boxing.pairing"| pairs
     kp -->|"boxing.pairing"| pairs
-    pairs -->|"pair_dataset.normalize_window"| norm
     clips -->|"epam_dataset: crop, resize"| crops
-    norm -->|"epam_dataset: same crop"| heat
+    pairs -->|"epam_dataset: same crop"| heat
     crops --> model
     heat --> model
     model --> out

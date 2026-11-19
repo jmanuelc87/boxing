@@ -29,12 +29,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from boxing.pair_dataset import FLIP_PERM, VALID_CONF
-
 IMAGE_SIZE = 224
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 MIN_CROP_PX = 64
+
+# COCO-17 left/right joint swap, used when mirroring a window.
+FLIP_PERM = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+# A joint counts as visible above this score.
+VALID_CONF = 0.1
 
 
 def crop_square(win: np.ndarray, width: int, height: int, margin: float = 0.25) -> tuple[int, int, int]:
